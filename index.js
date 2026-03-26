@@ -395,6 +395,86 @@ app.get('/api/github/branches', async (req, res) => {
   }
 });
 
+// --- Grep: search within a single file, return matching lines ---
+app.get('/api/github/grep', async (req, res) => {
+  const { repo, path, q } = req.query;
+  if (!repo || !path || !q) return res.status(400).json({ error: 'repo, path, and q parameters required' });
+  try {
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`);
+    if (data.type !== 'file') return res.status(400).json({ error: `${path} is a ${data.type}, not a file` });
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
+    const lines = content.split('\n');
+    const matches = [];
+    const query = String(q).toLowerCase();
+    lines.forEach((line, i) => {
+      if (line.toLowerCase().includes(query)) {
+        matches.push({ line: i + 1, text: line.trimEnd() });
+      }
+    });
+    res.json({ file: path, query: q, total: matches.length, matches });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Search: search across all files in a repo directory ---
+app.get('/api/github/search', async (req, res) => {
+  const { repo, path, q, ext } = req.query;
+  if (!repo || !q) return res.status(400).json({ error: 'repo and q parameters required' });
+  try {
+    const dir = path || '';
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${dir}`);
+    if (!Array.isArray(data)) return res.status(400).json({ error: 'path must be a directory' });
+    const files = data.filter(f => {
+      if (f.type !== 'file') return false;
+      if (ext && !f.name.endsWith(String(ext))) return false;
+      return true;
+    });
+    const results = [];
+    const query = String(q).toLowerCase();
+    for (const f of files.slice(0, 50)) { // limit to 50 files
+      try {
+        const fileData = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${f.path}`);
+        const content = Buffer.from(fileData.content, 'base64').toString('utf-8');
+        const lines = content.split('\n');
+        const matches = [];
+        lines.forEach((line, i) => {
+          if (line.toLowerCase().includes(query)) {
+            matches.push({ line: i + 1, text: line.trimEnd() });
+          }
+        });
+        if (matches.length > 0) {
+          results.push({ file: f.path, matches });
+        }
+      } catch (e) { /* skip unreadable files */ }
+    }
+    res.json({ query: q, directory: dir, filesSearched: files.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Read file with line range (for large files) ---
+app.get('/api/github/lines', async (req, res) => {
+  const { repo, path, from, to } = req.query;
+  if (!repo || !path) return res.status(400).json({ error: 'repo and path parameters required' });
+  try {
+    const data = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`);
+    if (data.type !== 'file') return res.status(400).json({ error: `${path} is a ${data.type}, not a file` });
+    const content = Buffer.from(data.content, 'base64').toString('utf-8');
+    const lines = content.split('\n');
+    const start = Math.max(1, parseInt(from) || 1);
+    const end = Math.min(lines.length, parseInt(to) || lines.length);
+    const selected = lines.slice(start - 1, end).map((text, i) => ({
+      line: start + i,
+      text: text.trimEnd(),
+    }));
+    res.json({ file: path, totalLines: lines.length, from: start, to: end, lines: selected });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- GET / without session header = health check ---
 app.get('/', (req, res) => {
   const sessionId = getSessionId(req);
