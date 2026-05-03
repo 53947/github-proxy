@@ -83,6 +83,78 @@ async function ghPost(path, body) {
   return JSON.parse(text);
 }
 
+async function ghPatch(path, body) {
+  const url = `${GITHUB_API}${path}`;
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GitHub PATCH ${res.status}: ${text}`);
+  return JSON.parse(text);
+}
+
+// Atomic multi-file commit via the Git Data API. Steps:
+//   1. Get the current head sha of the target branch
+//   2. Get the tree sha of that commit
+//   3. Create blobs for each new file
+//   4. Create a new tree based on the parent tree + the new blobs
+//   5. Create a commit pointing at the new tree, parented at the old head
+//   6. Update the branch ref to point at the new commit
+// Returns { commit_sha, tree_sha, branch, files_changed }.
+async function pushFilesAtomic(repo, files, message, branch) {
+  // 1. Resolve target branch (default = repo default branch)
+  let targetBranch = branch;
+  if (!targetBranch) {
+    const repoMeta = await ghFetch(`/repos/${GITHUB_ORG}/${repo}`);
+    targetBranch = repoMeta.default_branch;
+  }
+  // 2. Get current head ref + commit
+  const ref = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/git/ref/heads/${targetBranch}`);
+  const headSha = ref.object.sha;
+  const headCommit = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/git/commits/${headSha}`);
+  const baseTreeSha = headCommit.tree.sha;
+  // 3. Create blobs
+  const blobs = await Promise.all(files.map(async (f) => {
+    const blob = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/blobs`, {
+      content: Buffer.from(String(f.content), 'utf-8').toString('base64'),
+      encoding: 'base64',
+    });
+    return { path: normalizePath(f.path), sha: blob.sha };
+  }));
+  // 4. Create the new tree
+  const treeEntries = blobs.map(b => ({
+    path: b.path,
+    mode: '100644',
+    type: 'blob',
+    sha: b.sha,
+  }));
+  const tree = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/trees`, {
+    base_tree: baseTreeSha,
+    tree: treeEntries,
+  });
+  // 5. Create the commit
+  const commitMsg = message || `[linksblue] push ${files.length} file${files.length === 1 ? '' : 's'}`;
+  const commit = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/commits`, {
+    message: commitMsg,
+    tree: tree.sha,
+    parents: [headSha],
+  });
+  // 6. Update the ref
+  await ghPatch(`/repos/${GITHUB_ORG}/${repo}/git/refs/heads/${targetBranch}`, {
+    sha: commit.sha,
+  });
+  return {
+    status: 'pushed',
+    commit_sha: commit.sha,
+    tree_sha: tree.sha,
+    branch: targetBranch,
+    files_changed: files.length,
+    paths: blobs.map(b => b.path),
+  };
+}
+
 // Auto-fetch the current sha + content for an existing file. Returns
 // {sha, content} for files, null for missing, throws for directories.
 // Used by write_file (for sha + idempotency check) and delete_file (sha only).
@@ -469,6 +541,206 @@ function createMcpServer() {
     return { content: [{ type: 'text', text: JSON.stringify(commits, null, 2) }] };
   });
 
+  // --- v2.6: ATOMIC MULTI-FILE COMMITS via Git Data API ---
+
+  server.tool('push_files', 'Atomically commit MULTIPLE files in ONE commit. Use this instead of calling write_file multiple times when changes belong together — produces a single commit, single deploy. Files: array of {path, content}. Returns {commit_sha, files_changed}.', {
+    repo: z.string().describe('Repository name'),
+    files: z.array(z.object({
+      path: z.string().describe('File path within the repo'),
+      content: z.string().describe('Plain UTF-8 file content'),
+    })).describe('List of files to write or update — minimum 1, no upper limit'),
+    message: z.string().optional().describe('Commit message. Defaults to "[linksblue] push N files".'),
+    branch: z.string().optional().describe('Branch. Defaults to repo default.'),
+  }, async ({ repo, files, message, branch }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    if (!Array.isArray(files) || files.length === 0) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'files must be a non-empty array of {path, content}' }) }], isError: true };
+    }
+    try {
+      const result = await pushFilesAtomic(repo, files, message, branch);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE push_files (mcp) repo=${repo} count=${files.length} commit=${result.commit_sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  // --- v2.6: REFS — generic create_ref (branches AND tags) ---
+
+  server.tool('create_ref', 'Create any git ref — branch (refs/heads/X) or tag (refs/tags/X). Use this for tags; for plain branches you can also use create_branch. ref must include the full path like "refs/tags/v1.0" or "refs/heads/feature-x".', {
+    repo: z.string().describe('Repository name'),
+    ref: z.string().describe('Full ref path, e.g. "refs/tags/v1.0" or "refs/heads/feature-x"'),
+    sha: z.string().describe('Commit sha to point the ref at'),
+  }, async ({ repo, ref, sha }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/refs`, { ref, sha });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE create_ref (mcp) repo=${repo} ref=${ref} sha=${sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'created', ref: result.ref, sha: result.object.sha }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  // --- v2.6: PULL REQUESTS — staging→PR→merge workflow ---
+
+  server.tool('create_pull_request', 'Open a PR from a head branch into a base branch. Returns {number, url, state}.', {
+    repo: z.string().describe('Repository name'),
+    title: z.string().describe('PR title'),
+    head: z.string().describe('Source branch (the branch with the changes)'),
+    base: z.string().optional().describe('Target branch. Defaults to repo default branch.'),
+    body: z.string().optional().describe('PR description (markdown). Defaults to empty.'),
+    draft: z.boolean().optional().describe('Open as draft PR. Defaults to false.'),
+  }, async ({ repo, title, head, base, body, draft }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const targetBase = base || (await ghFetch(`/repos/${GITHUB_ORG}/${repo}`)).default_branch;
+      const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/pulls`, {
+        title, head, base: targetBase, body: body || '', draft: !!draft,
+      });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE create_pull_request (mcp) repo=${repo} #${result.number} ${head}->${targetBase}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ number: result.number, url: result.html_url, state: result.state, head: result.head.ref, base: result.base.ref }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('merge_pull_request', 'Merge an open PR. merge_method: "merge" (default — merge commit), "squash", or "rebase".', {
+    repo: z.string().describe('Repository name'),
+    number: z.number().int().describe('PR number'),
+    commit_title: z.string().optional().describe('Merge commit title'),
+    commit_message: z.string().optional().describe('Merge commit body'),
+    merge_method: z.enum(['merge', 'squash', 'rebase']).optional().describe('How to merge'),
+  }, async ({ repo, number, commit_title, commit_message, merge_method }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const body = {};
+      if (commit_title) body.commit_title = commit_title;
+      if (commit_message) body.commit_message = commit_message;
+      if (merge_method) body.merge_method = merge_method;
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/pulls/${number}/merge`, body);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE merge_pull_request (mcp) repo=${repo} #${number} sha=${result.sha.slice(0,7)} method=${merge_method || 'merge'}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ merged: result.merged, sha: result.sha, message: result.message }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  // --- v2.6: ISSUES — for Phase 3 weekly archive audit and similar reports ---
+
+  server.tool('create_issue', 'Open a new issue. Returns {number, url}.', {
+    repo: z.string().describe('Repository name'),
+    title: z.string().describe('Issue title'),
+    body: z.string().optional().describe('Issue body (markdown)'),
+    labels: z.array(z.string()).optional().describe('Label names to apply'),
+    assignees: z.array(z.string()).optional().describe('GitHub usernames to assign'),
+  }, async ({ repo, title, body, labels, assignees }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const payload = { title };
+      if (body) payload.body = body;
+      if (labels && labels.length) payload.labels = labels;
+      if (assignees && assignees.length) payload.assignees = assignees;
+      const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/issues`, payload);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE create_issue (mcp) repo=${repo} #${result.number}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ number: result.number, url: result.html_url, state: result.state }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('update_issue', 'Update an existing issue (close, reopen, edit title/body, add/remove labels).', {
+    repo: z.string().describe('Repository name'),
+    number: z.number().int().describe('Issue number'),
+    title: z.string().optional().describe('New title'),
+    body: z.string().optional().describe('New body'),
+    state: z.enum(['open', 'closed']).optional().describe('Set state'),
+    labels: z.array(z.string()).optional().describe('Replace labels with this set'),
+    assignees: z.array(z.string()).optional().describe('Replace assignees'),
+  }, async ({ repo, number, title, body, state, labels, assignees }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const payload = {};
+      if (title !== undefined) payload.title = title;
+      if (body !== undefined) payload.body = body;
+      if (state !== undefined) payload.state = state;
+      if (labels !== undefined) payload.labels = labels;
+      if (assignees !== undefined) payload.assignees = assignees;
+      const result = await ghPatch(`/repos/${GITHUB_ORG}/${repo}/issues/${number}`, payload);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE update_issue (mcp) repo=${repo} #${number} state=${result.state}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ number: result.number, url: result.html_url, state: result.state }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('add_issue_comment', 'Comment on an issue or PR (issues and PRs share a comment endpoint).', {
+    repo: z.string().describe('Repository name'),
+    number: z.number().int().describe('Issue or PR number'),
+    body: z.string().describe('Comment body (markdown)'),
+  }, async ({ repo, number, body }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/issues/${number}/comments`, { body });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE add_issue_comment (mcp) repo=${repo} #${number} comment=${result.id}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ id: result.id, url: result.html_url }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  // --- v2.6: ESCAPE HATCH — generic GitHub API passthrough ---
+  // Trust model: caller has bearer + the proxy's GITHUB_TOKEN governs what the
+  // call can actually do at GitHub. Path is logged in full.
+
+  server.tool('gh_api', 'ESCAPE HATCH. Call any GitHub REST API path with the proxy GITHUB_TOKEN. Use ONLY when no specialized tool exists. Method must be GET, POST, PATCH, PUT, or DELETE. path is the URL path after https://api.github.com (e.g. "/rate_limit", "/repos/X/Y/actions/workflows"). Body is optional JSON for non-GET requests.', {
+    method: z.enum(['GET', 'POST', 'PATCH', 'PUT', 'DELETE']).describe('HTTP method'),
+    path: z.string().describe('GitHub API path, must start with "/"'),
+    body: z.any().optional().describe('Request body for POST/PATCH/PUT/DELETE. Optional.'),
+  }, async ({ method, path, body }) => {
+    if (typeof path !== 'string' || !path.startsWith('/')) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: 'path must be a string starting with "/"' }) }], isError: true };
+    }
+    try {
+      const url = `${GITHUB_API}${path}`;
+      const opts = { method, headers: { ...ghHeaders(), 'Content-Type': 'application/json' } };
+      if (body !== undefined && method !== 'GET') opts.body = JSON.stringify(body);
+      const res = await fetch(url, opts);
+      const text = await res.text();
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE gh_api (mcp) ${method} ${path} → ${res.status}`);
+      let parsed;
+      try { parsed = JSON.parse(text); } catch { parsed = text; }
+      if (!res.ok) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: `GitHub ${method} ${res.status}`, body: parsed }) }], isError: true };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ status: res.status, body: parsed }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
   return server;
 }
 
@@ -847,6 +1119,141 @@ app.post('/api/github/branch', requireWriteKey, requireAllowedRepo, async (req, 
 });
 
 // --- Archive ingest endpoint ---
+// --- v2.6 REST endpoints — multi-file, refs, PRs, issues, raw passthrough ---
+
+app.post('/api/github/push', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, files, message, branch } = req.body || {};
+  if (!repo || !Array.isArray(files) || files.length === 0) {
+    return res.status(400).json({ error: 'repo and non-empty files array required' });
+  }
+  try {
+    const result = await pushFilesAtomic(repo, files, message, branch);
+    logWrite('push_files', req, { count: files.length, commit_sha: result.commit_sha.slice(0, 7) });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/ref', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, ref, sha } = req.body || {};
+  if (!repo || !ref || !sha) return res.status(400).json({ error: 'repo, ref, sha required' });
+  try {
+    const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/refs`, { ref, sha });
+    logWrite('create_ref', req, { ref, sha: sha.slice(0, 7) });
+    res.json({ status: 'created', ref: result.ref, sha: result.object.sha });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/pull', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, title, head, base, body, draft } = req.body || {};
+  if (!repo || !title || !head) return res.status(400).json({ error: 'repo, title, head required' });
+  try {
+    const targetBase = base || (await ghFetch(`/repos/${GITHUB_ORG}/${repo}`)).default_branch;
+    const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/pulls`, {
+      title, head, base: targetBase, body: body || '', draft: !!draft,
+    });
+    logWrite('create_pull_request', req, { number: result.number, head, base: targetBase });
+    res.json({ number: result.number, url: result.html_url, state: result.state, head: result.head.ref, base: result.base.ref });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.put('/api/github/pull/merge', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, number, commit_title, commit_message, merge_method } = req.body || {};
+  if (!repo || number == null) return res.status(400).json({ error: 'repo and number required' });
+  try {
+    const body = {};
+    if (commit_title) body.commit_title = commit_title;
+    if (commit_message) body.commit_message = commit_message;
+    if (merge_method) body.merge_method = merge_method;
+    const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/pulls/${number}/merge`, body);
+    logWrite('merge_pull_request', req, { number, sha: result.sha.slice(0, 7) });
+    res.json({ merged: result.merged, sha: result.sha, message: result.message });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/issue', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, title, body, labels, assignees } = req.body || {};
+  if (!repo || !title) return res.status(400).json({ error: 'repo and title required' });
+  try {
+    const payload = { title };
+    if (body) payload.body = body;
+    if (labels && labels.length) payload.labels = labels;
+    if (assignees && assignees.length) payload.assignees = assignees;
+    const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/issues`, payload);
+    logWrite('create_issue', req, { number: result.number });
+    res.json({ number: result.number, url: result.html_url, state: result.state });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.patch('/api/github/issue', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, number, title, body, state, labels, assignees } = req.body || {};
+  if (!repo || number == null) return res.status(400).json({ error: 'repo and number required' });
+  try {
+    const payload = {};
+    if (title !== undefined) payload.title = title;
+    if (body !== undefined) payload.body = body;
+    if (state !== undefined) payload.state = state;
+    if (labels !== undefined) payload.labels = labels;
+    if (assignees !== undefined) payload.assignees = assignees;
+    const result = await ghPatch(`/repos/${GITHUB_ORG}/${repo}/issues/${number}`, payload);
+    logWrite('update_issue', req, { number, state: result.state });
+    res.json({ number: result.number, url: result.html_url, state: result.state });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/issue/comment', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, number, body } = req.body || {};
+  if (!repo || number == null || !body) return res.status(400).json({ error: 'repo, number, body required' });
+  try {
+    const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/issues/${number}/comments`, { body });
+    logWrite('add_issue_comment', req, { number, comment: result.id });
+    res.json({ id: result.id, url: result.html_url });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Raw passthrough — no allow-list (path is variable), bearer-auth still required.
+app.post('/api/github/raw', requireWriteKey, async (req, res) => {
+  const { method, path: ghPath, body } = req.body || {};
+  if (!method || !ghPath) return res.status(400).json({ error: 'method and path required' });
+  if (!['GET', 'POST', 'PATCH', 'PUT', 'DELETE'].includes(method)) {
+    return res.status(400).json({ error: 'method must be GET, POST, PATCH, PUT, or DELETE' });
+  }
+  if (typeof ghPath !== 'string' || !ghPath.startsWith('/')) {
+    return res.status(400).json({ error: 'path must start with "/"' });
+  }
+  try {
+    const url = `${GITHUB_API}${ghPath}`;
+    const opts = { method, headers: { ...ghHeaders(), 'Content-Type': 'application/json' } };
+    if (body !== undefined && method !== 'GET') opts.body = JSON.stringify(body);
+    const ghRes = await fetch(url, opts);
+    const text = await ghRes.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { parsed = text; }
+    const ts = new Date().toISOString();
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    console.log(`[${ts}] WRITE gh_api (rest) ${method} ${ghPath} → ${ghRes.status} ip=${ip}`);
+    if (!ghRes.ok) {
+      return res.status(ghRes.status).json({ error: `GitHub ${method} ${ghRes.status}`, body: parsed });
+    }
+    res.json({ status: ghRes.status, body: parsed });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.use('/api/archive', require('./routes/archive-ingest'));
 
 // --- GET / without session header = health check ---
@@ -858,7 +1265,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'linksblue-github-proxy',
-    version: '2.5',
+    version: '2.6',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });

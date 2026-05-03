@@ -107,17 +107,41 @@ This line sits between the existing `/api/github/lines` route and the `app.get('
 
 Four MCP tools registered alongside the read tools, and four REST endpoints under `/api/github/*`. Gated by bearer auth (`LINKSBLUE_WRITE_KEY`) and repo allow-list (`WRITE_ALLOWED_REPOS`). The intent: linksblue is the SINGLE GitHub-access surface for the whole ecosystem — read AND write, public AND private — replacing the multi-connector setup with one.
 
-**MCP tools:**
-- `write_file` — DEFAULT WRITE TOOL. Just give repo, path, content. Sha auto-fetched. Message auto-generated as `[linksblue] update <path>` if omitted. Branch defaults to repo default. **Idempotent** — if content matches what's already there, returns `{status: "unchanged"}` without making a no-op commit.
-- `delete_file` — Just give repo, path. Sha auto-fetched. Message auto-generated.
-- `create_branch` — Just give repo, name. Defaults to branching from repo default branch HEAD.
-- `move_file` — Rename or move a file in one tool call. Internally: read source, write to dest, delete source (two commits server-side, one tool call from the agent's perspective).
+**MCP tools — single-file:**
+- `write_file` — DEFAULT WRITE TOOL FOR ONE FILE. Sha auto-fetched. Message auto-generated. Idempotent.
+- `delete_file` — Just give repo, path. Sha auto-fetched.
+- `create_branch` — Branch from another branch's HEAD.
+- `move_file` — Rename/move in one tool call.
+
+**MCP tools — multi-file and refs (v2.6):**
+- `push_files` — DEFAULT WRITE TOOL FOR MULTIPLE FILES. Atomic. ONE commit, ONE deploy. Use this instead of multiple `write_file` calls when changes belong together.
+- `create_ref` — Create any git ref (branch OR tag). For tags use `refs/tags/v1.0`; for branches `refs/heads/X` (or use `create_branch`).
+
+**MCP tools — pull requests (v2.6):**
+- `create_pull_request` — Open a PR. Auto-defaults `base` to repo default branch.
+- `merge_pull_request` — Merge a PR. Supports merge / squash / rebase methods.
+
+**MCP tools — issues (v2.6):**
+- `create_issue` — Open a new issue. Optional labels and assignees.
+- `update_issue` — Edit an issue (close/reopen, change title/body/labels).
+- `add_issue_comment` — Comment on an issue or PR.
+
+**MCP tool — escape hatch (v2.6):**
+- `gh_api` — Generic GitHub REST API passthrough. Use ONLY when no specialized tool exists. Forwards `{method, path, body}` with the proxy's GITHUB_TOKEN. Logged in full.
 
 **REST endpoints (parallel to MCP tools):**
 - `POST /api/github/file` — write_file
 - `DELETE /api/github/file` — delete_file
 - `POST /api/github/branch` — create_branch
 - `POST /api/github/move` — move_file
+- `POST /api/github/push` — push_files (multi-file atomic)
+- `POST /api/github/ref` — create_ref
+- `POST /api/github/pull` — create_pull_request
+- `PUT /api/github/pull/merge` — merge_pull_request
+- `POST /api/github/issue` — create_issue
+- `PATCH /api/github/issue` — update_issue
+- `POST /api/github/issue/comment` — add_issue_comment
+- `POST /api/github/raw` — gh_api passthrough
 
 **Lazy-agent-friendly defaults — these fields are OPTIONAL:**
 
@@ -154,15 +178,15 @@ If you find yourself about to write to `TRIADBLUE/linkblue` instead of `TRIADBLU
 ## DO NOT MODIFY (without an explicit prompt)
 
 - All nine read `server.tool(...)` registrations inside `createMcpServer()` in `index.js`.
-- All four write `server.tool(...)` registrations: `write_file`, `delete_file`, `create_branch`, `move_file`.
-- `ghHeaders()`, `ghFetch()`, `ghPut()`, `ghDeleteContents()`, `ghPost()`, `ghGetFile()`, `ghGetSha()` helpers.
+- All write `server.tool(...)` registrations: `write_file`, `delete_file`, `create_branch`, `move_file`, `push_files`, `create_ref`, `create_pull_request`, `merge_pull_request`, `create_issue`, `update_issue`, `add_issue_comment`, `gh_api`.
+- `ghHeaders()`, `ghFetch()`, `ghPut()`, `ghPost()`, `ghPatch()`, `ghDeleteContents()`, `ghGetFile()`, `ghGetSha()`, `pushFilesAtomic()` helpers.
 - `normalizePath()`, `defaultMessage()` helpers.
 - `getAllowedRepos()`, `isRepoAllowed()`, `repoDenialReason()` allow-list functions.
 - `requireWriteKey()`, `requireAllowedRepo()`, `logWrite()` middleware.
 - `InMemoryEventStore` class.
 - `handleMcpPost`, `handleMcpGet`, `handleMcpDelete`, `handleMcpHead` handlers.
 - The `app.head/post/get/delete('/mcp', ...)` and `app.head/post/delete('/', ...)` MCP route mounts.
-- All `/api/github/*` REST endpoints (read AND write).
+- All `/api/github/*` REST endpoints (read AND write — see full inventory above).
 - `GITHUB_TOKEN` flow.
 - Existing CORS middleware.
 
@@ -205,6 +229,7 @@ Cowork scheduled task. Pulls `ai-archive`, rebuilds the index, detects drift bet
 |------|---------|
 | 2026-05-03 | **Phase 1 — Archive ingest endpoint added.** Builds on the prior 2.4 deploy (which already shipped `consoleblue-github-proxy` → `linksblue-github-proxy` rename and added `write_file`/`delete_file`/`create_branch` MCP tools). `package.json` `name` field changed to `"linksblue"`. New file `routes/archive-ingest.js` implements `POST /api/archive/ingest` with bearer auth (`ARCHIVE_API_KEY`), body validation (platform enum, ISO 8601 timestamps, non-empty `source_id`), GitHub code-search dedupe on `source_id`, and PUT-to-Contents-API commit to `TRIADBLUE/ai-archive` at path `YYYY/MM/DD-{platform}-{slug}.md`. `index.js` patched with one wiring line `app.use('/api/archive', require('./routes/archive-ingest'))` inserted before the health-check route — all existing GitHub MCP tools, REST endpoints, MCP session handling, and `/mcp` mounts left untouched. New root `README.md` documents the service, URLs, endpoints, env vars. New `CLAUDE.md` (this file) replaces the prior placeholder. Companion repo `TRIADBLUE/ai-archive` initialized with its own `README.md` documenting the folder structure and file format. (Prompt 05/01/2026-9, Gate 2.) |
 | 2026-05-03 | **v2.5 — write endpoints made lazy-agent-friendly.** Builds on v2.4. (1) `message` field is now optional on write_file, delete_file, move_file — defaults to `[linksblue] <op> <path>`. (2) Path normalization helper strips leading/trailing slashes and whitespace before any GitHub API call. (3) `write_file` now does an idempotency check: if the new content matches the current file's content, returns `{status: "unchanged"}` and does not make a no-op commit. (4) New tool `move_file` (and `POST /api/github/move`) renames/moves a file in one tool call — server does the read+write+delete sequence internally. (5) `WRITE_ALLOWED_REPOS=*` wildcard supported (any repo in the org). (6) MCP tool descriptions rewritten to be self-explanatory: each one tells the agent what's required vs auto-handled. (7) `ghGetFile()` helper introduced returning `{sha, content}` so the idempotency check doesn't add a round trip; `ghGetSha()` retained as a thin wrapper. Service version bumped 2.4 → 2.5. (Prompt 05/03/2026-12.) |
+| 2026-05-03 | **v2.6 — agent toolkit completion.** Per Cowork's gap analysis, eight new MCP tools and seven new REST endpoints, addressing the workflow gaps that forced 5 separate Railway deploys for what was logically one Phase 1 commit. (1) `push_files` (POST /api/github/push) — atomic multi-file commit via Git Data API (blobs → tree → commit → ref update); ONE commit for any number of files. (2) `create_pull_request` (POST /api/github/pull) — opens PRs with auto-default base branch, enables the "Cowork pushes to staging, Dean merges" workflow. (3) `merge_pull_request` (PUT /api/github/pull/merge) — merge / squash / rebase methods. (4) `create_ref` (POST /api/github/ref) — generic ref creation for tags AND branches (Cowork couldn't tag the pre-Phase-1 restore point earlier — fixed). (5) `create_issue` (POST /api/github/issue) + `update_issue` (PATCH /api/github/issue) + `add_issue_comment` (POST /api/github/issue/comment) — needed for Phase 3 weekly archive audit (auto-open and auto-close weekly status issues). (6) `gh_api` (POST /api/github/raw) — generic GitHub REST API passthrough escape hatch for future API needs (rate limit checks, workflow dispatches, releases, deployments) without shipping new tools. New helpers: `ghPatch()`, `pushFilesAtomic()`. Service version bumped 2.5 → 2.6. (Prompt 05/03/2026-12, Cowork feedback.) |
 
 **AGENTS: Update this section on every commit. Your work is not done until this changelog reflects it.**
 **AGENTS: All code changes go to `staging` branch. NEVER push to `main` directly.**
