@@ -47,6 +47,92 @@ async function ghFetch(path) {
   return res.json();
 }
 
+async function ghPut(path, body) {
+  const url = `${GITHUB_API}${path}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GitHub PUT ${res.status}: ${text}`);
+  return JSON.parse(text);
+}
+
+async function ghDeleteContents(path, body) {
+  const url = `${GITHUB_API}${path}`;
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GitHub DELETE ${res.status}: ${text}`);
+  return JSON.parse(text);
+}
+
+async function ghPost(path, body) {
+  const url = `${GITHUB_API}${path}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GitHub POST ${res.status}: ${text}`);
+  return JSON.parse(text);
+}
+
+// Auto-fetch the current sha for an existing file (needed for update + delete).
+// Returns null if the file doesn't exist (so callers can distinguish create vs update).
+async function ghGetSha(repo, path, branch) {
+  const ref = branch ? `?ref=${encodeURIComponent(branch)}` : '';
+  const url = `${GITHUB_API}/repos/${GITHUB_ORG}/${repo}/contents/${path}${ref}`;
+  const res = await fetch(url, { headers: ghHeaders() });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`GitHub GET sha ${res.status}: ${body}`);
+  }
+  const data = await res.json();
+  if (Array.isArray(data)) throw new Error(`${path} is a directory, not a file`);
+  return data.sha;
+}
+
+// --- Write-endpoint security: bearer auth + repo allow-list ---
+function getAllowedRepos() {
+  const raw = process.env.WRITE_ALLOWED_REPOS || '';
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function requireWriteKey(req, res, next) {
+  const expected = process.env.LINKSBLUE_WRITE_KEY;
+  const got = req.headers.authorization || '';
+  if (!expected) return res.status(401).json({ error: 'write endpoint disabled — LINKSBLUE_WRITE_KEY not configured' });
+  if (got !== `Bearer ${expected}`) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+function requireAllowedRepo(req, res, next) {
+  const repo = (req.body && req.body.repo) || req.query.repo;
+  if (!repo) return res.status(400).json({ error: 'repo required' });
+  const allowed = getAllowedRepos();
+  if (allowed.length === 0) return res.status(403).json({ error: 'no repos in WRITE_ALLOWED_REPOS — writes disabled' });
+  if (!allowed.includes(repo)) return res.status(403).json({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` });
+  next();
+}
+
+function logWrite(op, req, extra = {}) {
+  const ts = new Date().toISOString();
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const repo = (req.body && req.body.repo) || req.query.repo || '?';
+  const path = (req.body && req.body.path) || req.query.path || '?';
+  const auth = req.headers.authorization || '';
+  const authHash = auth ? crypto.createHash('sha256').update(auth).digest('hex').slice(0, 8) : 'none';
+  const size = req.body && req.body.content ? Buffer.byteLength(req.body.content, 'utf-8') : 0;
+  console.log(`[${ts}] WRITE ${op} repo=${repo} path=${path} bytes=${size} ip=${ip} auth=${authHash} ${JSON.stringify(extra)}`);
+}
+
 // --- In-memory event store for session resumability ---
 class InMemoryEventStore {
   constructor() {
@@ -186,6 +272,95 @@ function createMcpServer() {
       url: i.html_url,
     }));
     return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+  });
+
+  // --- WRITE TOOLS — gated by allow-list (NOT by bearer in MCP, since MCP transport handles auth at the connector layer) ---
+
+  server.tool('write_file', 'Create or update a file in a repo. Auto-fetches sha if file exists.', {
+    repo: z.string().describe('Repository name'),
+    path: z.string().describe('File path within the repo'),
+    content: z.string().describe('Plain UTF-8 file content (will be base64-encoded server-side)'),
+    message: z.string().describe('Commit message'),
+    branch: z.string().optional().describe('Branch to commit to (default: repo default branch)'),
+    sha: z.string().optional().describe('Sha of file being replaced. Auto-fetched if omitted.'),
+  }, async ({ repo, path, content, message, branch, sha }) => {
+    const allowed = getAllowedRepos();
+    if (!allowed.includes(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    }
+    try {
+      let resolvedSha = sha;
+      if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+      const body = {
+        message,
+        content: Buffer.from(content, 'utf-8').toString('base64'),
+      };
+      if (resolvedSha) body.sha = resolvedSha;
+      if (branch) body.branch = branch;
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE write_file (mcp) repo=${repo} path=${path} bytes=${Buffer.byteLength(content, 'utf-8')} sha=${result.commit.sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: resolvedSha ? 'updated' : 'created', path: result.content.path, commit_sha: result.commit.sha }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('delete_file', 'Delete a file from a repo. Auto-fetches sha.', {
+    repo: z.string().describe('Repository name'),
+    path: z.string().describe('File path within the repo'),
+    message: z.string().describe('Commit message'),
+    branch: z.string().optional().describe('Branch to delete from (default: repo default branch)'),
+    sha: z.string().optional().describe('Sha of file. Auto-fetched if omitted.'),
+  }, async ({ repo, path, message, branch, sha }) => {
+    const allowed = getAllowedRepos();
+    if (!allowed.includes(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    }
+    try {
+      let resolvedSha = sha;
+      if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+      if (!resolvedSha) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: `file not found: ${path}` }) }], isError: true };
+      }
+      const body = { message, sha: resolvedSha };
+      if (branch) body.branch = branch;
+      const result = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE delete_file (mcp) repo=${repo} path=${path} sha=${result.commit.sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'deleted', path, commit_sha: result.commit.sha }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('create_branch', 'Create a new branch from another branch or sha', {
+    repo: z.string().describe('Repository name'),
+    name: z.string().describe('New branch name'),
+    from_sha: z.string().optional().describe('Sha to branch from'),
+    from_branch: z.string().optional().describe('Branch to branch from (default: repo default branch)'),
+  }, async ({ repo, name, from_sha, from_branch }) => {
+    const allowed = getAllowedRepos();
+    if (!allowed.includes(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    }
+    try {
+      let sha = from_sha;
+      if (!sha) {
+        const sourceBranch = from_branch || (await ghFetch(`/repos/${GITHUB_ORG}/${repo}`)).default_branch;
+        const refData = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/git/ref/heads/${sourceBranch}`);
+        sha = refData.object.sha;
+      }
+      const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/refs`, {
+        ref: `refs/heads/${name}`,
+        sha,
+      });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE create_branch (mcp) repo=${repo} branch=${name} from=${sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'created', branch: name, sha, ref: result.ref }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
   });
 
   server.tool('list_commits', 'List recent commits for a repo', {
@@ -475,6 +650,70 @@ app.get('/api/github/lines', async (req, res) => {
   }
 });
 
+// --- WRITE REST endpoints (bearer-auth + repo-allow-list gated) ---
+
+app.post('/api/github/file', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, path, content, message, branch, sha } = req.body || {};
+  if (!repo || !path || content == null || !message) {
+    return res.status(400).json({ error: 'repo, path, content, message all required' });
+  }
+  try {
+    let resolvedSha = sha;
+    if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+    const body = {
+      message,
+      content: Buffer.from(String(content), 'utf-8').toString('base64'),
+    };
+    if (resolvedSha) body.sha = resolvedSha;
+    if (branch) body.branch = branch;
+    const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+    logWrite('write_file', req, { commit_sha: result.commit.sha.slice(0, 7), op: resolvedSha ? 'update' : 'create' });
+    res.json({ status: resolvedSha ? 'updated' : 'created', path: result.content.path, sha: result.content.sha, commit_sha: result.commit.sha });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.delete('/api/github/file', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, path, message, branch, sha } = req.body || {};
+  if (!repo || !path || !message) {
+    return res.status(400).json({ error: 'repo, path, message all required' });
+  }
+  try {
+    let resolvedSha = sha;
+    if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+    if (!resolvedSha) return res.status(404).json({ error: `file not found: ${path}` });
+    const body = { message, sha: resolvedSha };
+    if (branch) body.branch = branch;
+    const result = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+    logWrite('delete_file', req, { commit_sha: result.commit.sha.slice(0, 7) });
+    res.json({ status: 'deleted', path, commit_sha: result.commit.sha });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/branch', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, name, from_sha, from_branch } = req.body || {};
+  if (!repo || !name) return res.status(400).json({ error: 'repo and name required' });
+  try {
+    let sha = from_sha;
+    if (!sha) {
+      const sourceBranch = from_branch || (await ghFetch(`/repos/${GITHUB_ORG}/${repo}`)).default_branch;
+      const refData = await ghFetch(`/repos/${GITHUB_ORG}/${repo}/git/ref/heads/${sourceBranch}`);
+      sha = refData.object.sha;
+    }
+    const result = await ghPost(`/repos/${GITHUB_ORG}/${repo}/git/refs`, {
+      ref: `refs/heads/${name}`,
+      sha,
+    });
+    logWrite('create_branch', req, { branch: name, from_sha: sha.slice(0, 7) });
+    res.json({ status: 'created', branch: name, sha, ref: result.ref });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- GET / without session header = health check ---
 app.get('/', (req, res) => {
   const sessionId = getSessionId(req);
@@ -483,8 +722,8 @@ app.get('/', (req, res) => {
   }
   res.json({
     status: 'ok',
-    service: 'consoleblue-github-proxy',
-    version: '2.3',
+    service: 'linksblue-github-proxy',
+    version: '2.4',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
