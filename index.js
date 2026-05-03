@@ -155,6 +155,208 @@ async function pushFilesAtomic(repo, files, message, branch) {
   };
 }
 
+// --- v2.7: PROMPT LOG operations (atomic claim + lifecycle) ---
+// Storage: TRIADBLUE/ai-archive/PROMPT_LOG.md
+// Concurrency: optimistic (read sha, modify, conditional PUT, retry up to 3x)
+
+const ARCHIVE_REPO = 'ai-archive';
+const PROMPT_LOG_PATH = 'PROMPT_LOG.md';
+const MAX_CLAIM_RETRIES = 3;
+
+function parseHighestN(content) {
+  let max = 0;
+  const re = /\d{2}\/\d{2}\/\d{4}-(\d+)/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+function findResponsesForParent(content, parentDate, parentN) {
+  const escaped = parentDate.replace(/\//g, '\\/');
+  const re = new RegExp(`${escaped}-${parentN}([a-z]+)\\b`, 'g');
+  const letters = [];
+  let m;
+  while ((m = re.exec(content)) !== null) letters.push(m[1]);
+  return letters;
+}
+
+function nextAlphabetic(s) {
+  if (!s) return 'a';
+  const last = s.charCodeAt(s.length - 1);
+  if (last < 'z'.charCodeAt(0)) {
+    return s.slice(0, -1) + String.fromCharCode(last + 1);
+  }
+  return nextAlphabetic(s.slice(0, -1)) + 'a';
+}
+
+function highestLetterFrom(letters) {
+  if (!letters.length) return null;
+  const sorted = letters.slice().sort((a, b) => {
+    if (a.length !== b.length) return a.length - b.length;
+    return a.localeCompare(b);
+  });
+  return sorted[sorted.length - 1];
+}
+
+function todayDateMMDDYYYY() {
+  const d = new Date();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${mm}/${dd}/${d.getUTCFullYear()}`;
+}
+
+function todayISODate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function buildPromptRow({ id, type, dateISO, title, platform, agent, status, commitSha, note }) {
+  return `| ${id} | ${type} | ${dateISO} | ${title || ''} | ${platform || ''} | ${agent || ''} | ${status} | ${commitSha || '—'} | ${note || ''} |`;
+}
+
+function insertRowAtTopOfLog(content, newRow) {
+  // The header separator row is the unique anchor — insert immediately after it.
+  const sepRegex = /(\| --- \| --- \| --- \| --- \| --- \| --- \| --- \| --- \| --- \|\n)/;
+  if (!sepRegex.test(content)) {
+    throw new Error('PROMPT_LOG.md does not contain the expected table separator row');
+  }
+  return content.replace(sepRegex, `$1${newRow}\n`);
+}
+
+function updateNextNumberLine(content, nextN) {
+  return content.replace(/The next PROMPT or SEGUE will be N=\d+\./, `The next PROMPT or SEGUE will be N=${nextN}.`);
+}
+
+function updateRowStatus(content, id, newStatus, commitSha, note) {
+  const lines = content.split('\n');
+  let modified = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith(`| ${id} |`)) continue;
+    const cols = lines[i].split('|').map(s => s.trim());
+    // ['', id, type, date, title, platform, agent, status, commit_sha, note, '']
+    if (cols.length < 11) continue;
+    cols[7] = newStatus;
+    if (commitSha !== undefined && commitSha !== null) cols[8] = commitSha;
+    if (note !== undefined && note !== null && note !== '') {
+      const oldNote = cols[9] || '';
+      cols[9] = oldNote && oldNote !== '' ? `${oldNote}; ${note}` : note;
+    }
+    lines[i] = '| ' + cols.slice(1, -1).join(' | ') + ' |';
+    modified = true;
+    break;
+  }
+  return modified ? lines.join('\n') : null;
+}
+
+function isShaConflict(err) {
+  const msg = (err && err.message) || '';
+  return /\b(409|422)\b/.test(msg) || /does not match/i.test(msg) || /sha/i.test(msg) && /match/i.test(msg);
+}
+
+async function claimNumberAtomic({ type, platform, agent, title, coversPrompts }) {
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
+    try {
+      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      const { sha, content } = file;
+      const highestN = parseHighestN(content);
+      const nextN = highestN + 1;
+      const date = todayDateMMDDYYYY();
+      const id = `${date}-${nextN}`;
+      let note = '';
+      if (type === 'SEGUE' && coversPrompts && coversPrompts.length) {
+        note = `covers: ${coversPrompts.join(', ')}`;
+      }
+      const row = buildPromptRow({
+        id, type,
+        dateISO: todayISODate(),
+        title, platform, agent,
+        status: 'claimed',
+        note,
+      });
+      let newContent = insertRowAtTopOfLog(content, row);
+      newContent = updateNextNumberLine(newContent, nextN + 1);
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${ARCHIVE_REPO}/contents/${PROMPT_LOG_PATH}`, {
+        message: `claim ${type} ${id}${title ? ` (${title})` : ''}`,
+        content: Buffer.from(newContent, 'utf-8').toString('base64'),
+        sha,
+      });
+      return { n: nextN, date, id, type, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
+    } catch (err) {
+      lastErr = err;
+      if (isShaConflict(err)) continue;
+      throw err;
+    }
+  }
+  throw new Error(`claim conflict after ${MAX_CLAIM_RETRIES} retries: ${(lastErr && lastErr.message) || 'unknown'}`);
+}
+
+async function claimResponseAtomic({ parentN, parentDate, platform, agent, title }) {
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
+    try {
+      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      const { sha, content } = file;
+      const existing = findResponsesForParent(content, parentDate, parentN);
+      const next = existing.length ? nextAlphabetic(highestLetterFrom(existing)) : 'a';
+      const id = `${parentDate}-${parentN}${next}`;
+      const row = buildPromptRow({
+        id, type: 'RESPONSE',
+        dateISO: todayISODate(),
+        title, platform, agent,
+        status: 'claimed',
+        note: `parent: ${parentDate}-${parentN}`,
+      });
+      const newContent = insertRowAtTopOfLog(content, row);
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${ARCHIVE_REPO}/contents/${PROMPT_LOG_PATH}`, {
+        message: `claim RESPONSE ${id}${title ? ` (${title})` : ''}`,
+        content: Buffer.from(newContent, 'utf-8').toString('base64'),
+        sha,
+      });
+      return { letter: next, parent: `${parentDate}-${parentN}`, id, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
+    } catch (err) {
+      lastErr = err;
+      if (isShaConflict(err)) continue;
+      throw err;
+    }
+  }
+  throw new Error(`claim conflict after ${MAX_CLAIM_RETRIES} retries: ${(lastErr && lastErr.message) || 'unknown'}`);
+}
+
+async function updatePromptStatusAtomic({ id, status, commitSha, note }) {
+  let lastErr;
+  for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
+    try {
+      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      const { sha, content } = file;
+      if (!content.includes(`| ${id} |`)) {
+        const err = new Error(`row not found: ${id}`);
+        err.notFound = true;
+        throw err;
+      }
+      const newContent = updateRowStatus(content, id, status, commitSha, note);
+      if (newContent === null) throw new Error(`row not modified: ${id}`);
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${ARCHIVE_REPO}/contents/${PROMPT_LOG_PATH}`, {
+        message: `update ${id}: ${status}${commitSha ? ` (${String(commitSha).slice(0, 7)})` : ''}`,
+        content: Buffer.from(newContent, 'utf-8').toString('base64'),
+        sha,
+      });
+      return { status: 'updated', id, new_status: status, log_commit_sha: result.commit.sha };
+    } catch (err) {
+      lastErr = err;
+      if (err.notFound) throw err;
+      if (isShaConflict(err)) continue;
+      throw err;
+    }
+  }
+  throw new Error(`update conflict after ${MAX_CLAIM_RETRIES} retries: ${(lastErr && lastErr.message) || 'unknown'}`);
+}
+
 // Auto-fetch the current sha + content for an existing file. Returns
 // {sha, content} for files, null for missing, throws for directories.
 // Used by write_file (for sha + idempotency check) and delete_file (sha only).
@@ -710,6 +912,58 @@ function createMcpServer() {
     }
   });
 
+  // --- v2.7: PROMPT NUMBERING — atomic claim against ai-archive/PROMPT_LOG.md ---
+
+  server.tool('claim_number', 'CLAIM A NEW PROMPT OR SEGUE NUMBER. Atomic. Reads the master log in TRIADBLUE/ai-archive/PROMPT_LOG.md, finds the highest N, claims N+1, writes a row with status=claimed, returns the assigned id. NEVER guess a number — always claim. After firing, call update_prompt_status to mark "fired"; after commit, "committed" with the commit SHA; after verification, "verified".', {
+    type: z.enum(['PROMPT', 'SEGUE']).describe('PROMPT for new work, SEGUE for session-boundary handoff'),
+    platform: z.string().describe('"Executing for Platform" header value, e.g. "businessblueprint.io" or "TRIADBLUE"'),
+    agent: z.string().describe('Who is making the claim, e.g. "Claude Code (Mac)" or "Cowork" or "Claude web chat"'),
+    title: z.string().optional().describe('Short title of the prompt or segue'),
+    covers_prompts: z.array(z.string()).optional().describe('SEGUE only: list of prompt IDs this segue covers (e.g. ["04/29/2026-3", "04/29/2026-4"])'),
+  }, async ({ type, platform, agent, title, covers_prompts }) => {
+    try {
+      const result = await claimNumberAtomic({ type, platform, agent, title, coversPrompts: covers_prompts });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] CLAIM ${type} (mcp) id=${result.id} agent="${agent}"`);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('claim_response', 'CLAIM A RESPONSE LETTER (a, b, c, ...) under an existing parent prompt. Responses do NOT increment N — they letter-suffix the parent. Atomic. Reads PROMPT_LOG.md, finds the parent row, computes the next available letter, writes a row.', {
+    parent_n: z.number().int().describe('Parent prompt N (e.g. 8 for parent 04/29/2026-8)'),
+    parent_date: z.string().describe('Parent prompt date in MM/DD/YYYY format'),
+    platform: z.string().describe('"Executing for Platform" header value'),
+    agent: z.string().describe('Who is making the claim'),
+    title: z.string().optional().describe('Short title of the response'),
+  }, async ({ parent_n, parent_date, platform, agent, title }) => {
+    try {
+      const result = await claimResponseAtomic({ parentN: parent_n, parentDate: parent_date, platform, agent, title });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] CLAIM RESPONSE (mcp) id=${result.id} agent="${agent}"`);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('update_prompt_status', 'Update the status of a row in PROMPT_LOG.md. Use the lifecycle: claimed → fired → committed → verified. (Or → abandoned if the work is dropped.)', {
+    id: z.string().describe('Full prompt ID, e.g. "05/03/2026-13"'),
+    status: z.enum(['claimed', 'fired', 'committed', 'verified', 'abandoned']).describe('New status'),
+    commit_sha: z.string().optional().describe('Commit SHA. Required when status=committed or verified.'),
+    note: z.string().optional().describe('Optional note appended to the row'),
+  }, async ({ id, status, commit_sha, note }) => {
+    try {
+      const result = await updatePromptStatusAtomic({ id, status, commitSha: commit_sha, note });
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] UPDATE_STATUS (mcp) id=${id} status=${status}`);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
   // --- v2.6: ESCAPE HATCH — generic GitHub API passthrough ---
   // Trust model: caller has bearer + the proxy's GITHUB_TOKEN governs what the
   // call can actually do at GitHub. Path is logged in full.
@@ -1254,6 +1508,62 @@ app.post('/api/github/raw', requireWriteKey, async (req, res) => {
   }
 });
 
+// --- v2.7 REST endpoints — atomic prompt-log claim + lifecycle ---
+
+app.post('/api/archive/claim-number', requireWriteKey, async (req, res) => {
+  const { type, platform, agent, title, covers_prompts } = req.body || {};
+  if (!type || !platform || !agent) {
+    return res.status(400).json({ error: 'type, platform, agent all required' });
+  }
+  if (!['PROMPT', 'SEGUE'].includes(type)) {
+    return res.status(400).json({ error: 'type must be "PROMPT" or "SEGUE"' });
+  }
+  try {
+    const result = await claimNumberAtomic({ type, platform, agent, title, coversPrompts: covers_prompts });
+    const ts = new Date().toISOString();
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    console.log(`[${ts}] CLAIM ${type} (rest) id=${result.id} agent="${agent}" ip=${ip}`);
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/archive/claim-response', requireWriteKey, async (req, res) => {
+  const { parent_n, parent_date, platform, agent, title } = req.body || {};
+  if (parent_n == null || !parent_date || !platform || !agent) {
+    return res.status(400).json({ error: 'parent_n, parent_date, platform, agent all required' });
+  }
+  try {
+    const result = await claimResponseAtomic({ parentN: parent_n, parentDate: parent_date, platform, agent, title });
+    const ts = new Date().toISOString();
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    console.log(`[${ts}] CLAIM RESPONSE (rest) id=${result.id} agent="${agent}" ip=${ip}`);
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.patch('/api/archive/prompt-status', requireWriteKey, async (req, res) => {
+  const { id, status, commit_sha, note } = req.body || {};
+  if (!id || !status) {
+    return res.status(400).json({ error: 'id and status required' });
+  }
+  if (!['claimed', 'fired', 'committed', 'verified', 'abandoned'].includes(status)) {
+    return res.status(400).json({ error: 'invalid status' });
+  }
+  try {
+    const result = await updatePromptStatusAtomic({ id, status, commitSha: commit_sha, note });
+    const ts = new Date().toISOString();
+    console.log(`[${ts}] UPDATE_STATUS (rest) id=${id} status=${status}`);
+    res.json(result);
+  } catch (err) {
+    if (err.notFound) return res.status(404).json({ error: err.message });
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.use('/api/archive', require('./routes/archive-ingest'));
 
 // --- GET / without session header = health check ---
@@ -1265,7 +1575,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'linksblue-github-proxy',
-    version: '2.6',
+    version: '2.7',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
