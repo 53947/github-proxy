@@ -100,9 +100,28 @@ async function ghGetSha(repo, path, branch) {
 }
 
 // --- Write-endpoint security: bearer auth + repo allow-list ---
+// WRITE_ALLOWED_REPOS supports three modes:
+//   - "*"          → any repo in the GITHUB_ORG is writable (use with care)
+//   - "a,b,c"      → only listed repos are writable
+//   - unset/empty  → all writes denied
 function getAllowedRepos() {
-  const raw = process.env.WRITE_ALLOWED_REPOS || '';
+  const raw = (process.env.WRITE_ALLOWED_REPOS || '').trim();
+  if (raw === '*') return '*';
   return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function isRepoAllowed(repo) {
+  const allowed = getAllowedRepos();
+  if (allowed === '*') return true;
+  if (allowed.length === 0) return false;
+  return allowed.includes(repo);
+}
+
+function repoDenialReason(repo) {
+  const allowed = getAllowedRepos();
+  if (allowed === '*') return null;
+  if (allowed.length === 0) return 'no repos in WRITE_ALLOWED_REPOS — writes disabled';
+  return `repo "${repo}" not in WRITE_ALLOWED_REPOS`;
 }
 
 function requireWriteKey(req, res, next) {
@@ -116,9 +135,7 @@ function requireWriteKey(req, res, next) {
 function requireAllowedRepo(req, res, next) {
   const repo = (req.body && req.body.repo) || req.query.repo;
   if (!repo) return res.status(400).json({ error: 'repo required' });
-  const allowed = getAllowedRepos();
-  if (allowed.length === 0) return res.status(403).json({ error: 'no repos in WRITE_ALLOWED_REPOS — writes disabled' });
-  if (!allowed.includes(repo)) return res.status(403).json({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` });
+  if (!isRepoAllowed(repo)) return res.status(403).json({ error: repoDenialReason(repo) });
   next();
 }
 
@@ -284,9 +301,8 @@ function createMcpServer() {
     branch: z.string().optional().describe('Branch to commit to (default: repo default branch)'),
     sha: z.string().optional().describe('Sha of file being replaced. Auto-fetched if omitted.'),
   }, async ({ repo, path, content, message, branch, sha }) => {
-    const allowed = getAllowedRepos();
-    if (!allowed.includes(repo)) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
     }
     try {
       let resolvedSha = sha;
@@ -313,9 +329,8 @@ function createMcpServer() {
     branch: z.string().optional().describe('Branch to delete from (default: repo default branch)'),
     sha: z.string().optional().describe('Sha of file. Auto-fetched if omitted.'),
   }, async ({ repo, path, message, branch, sha }) => {
-    const allowed = getAllowedRepos();
-    if (!allowed.includes(repo)) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
     }
     try {
       let resolvedSha = sha;
@@ -340,9 +355,8 @@ function createMcpServer() {
     from_sha: z.string().optional().describe('Sha to branch from'),
     from_branch: z.string().optional().describe('Branch to branch from (default: repo default branch)'),
   }, async ({ repo, name, from_sha, from_branch }) => {
-    const allowed = getAllowedRepos();
-    if (!allowed.includes(repo)) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `repo "${repo}" not in WRITE_ALLOWED_REPOS` }) }], isError: true };
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
     }
     try {
       let sha = from_sha;

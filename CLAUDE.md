@@ -43,8 +43,11 @@ Legacy origin: https://linkblue-githubproxy.up.railway.app (still active)
 - `GITHUB_ORG` — defaults to `TRIADBLUE`. Override only if testing.
 - `LINKSBLUE_WRITE_KEY` — required for write endpoints. 32-char random.
   Without it, writes return 401.
-- `WRITE_ALLOWED_REPOS` — comma-separated repo names that may be written
-  to. Without it, writes return 403. Reads are unaffected.
+- `WRITE_ALLOWED_REPOS` — controls which repos accept writes. Three modes:
+  - `*` — any repo in the GITHUB_ORG is writable (broadest; default for Dean's setup)
+  - `repo1,repo2,repo3` — only listed repos are writable (strictest)
+  - unset/empty — all writes return 403 (disabled)
+  Reads are unaffected by this variable.
 
 ## SECURITY MODEL
 
