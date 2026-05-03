@@ -17,10 +17,16 @@ If the proxy's `GITHUB_TOKEN` does not yet have access to the private `triadblue
 curl -s "https://github.linksblue.network/api/github/file?repo=.github&path=CLAUDE.MD"
 ```
 
-Also read the continuity briefing:
+Also read the continuity briefing (now in markdown — was migrated from .txt 2026-05-02):
 
 ```
-curl -s "https://github.linksblue.network/api/github/file?repo=triadblue.rulebook&path=TRIADBLUE_CONTINUITY_BRIEFING.txt"
+curl -s "https://github.linksblue.network/api/github/file?repo=triadblue.rulebook&path=TRIADBLUE_CONTINUITY_BRIEFING.md"
+```
+
+Also read the editing rules:
+
+```
+curl -s "https://github.linksblue.network/api/github/file?repo=triadblue.rulebook&path=RULEBOOK_EDITING_RULES.md"
 ```
 
 These rules govern brand casing, payment, ecosystem standards. Non-negotiable.
@@ -97,6 +103,41 @@ This line sits between the existing `/api/github/lines` route and the `app.get('
 
 `TRIADBLUE/ai-archive` (private). One markdown file per conversation. Phase 2 will add `archive.db` (SQLite FTS5) at the repo root for keyword search.
 
+### GitHub WRITE tools (added 2026-05-03 by Prompt 05/03/2026-12)
+
+Four MCP tools registered alongside the read tools, and four REST endpoints under `/api/github/*`. Gated by bearer auth (`LINKSBLUE_WRITE_KEY`) and repo allow-list (`WRITE_ALLOWED_REPOS`). The intent: linksblue is the SINGLE GitHub-access surface for the whole ecosystem — read AND write, public AND private — replacing the multi-connector setup with one.
+
+**MCP tools:**
+- `write_file` — DEFAULT WRITE TOOL. Just give repo, path, content. Sha auto-fetched. Message auto-generated as `[linksblue] update <path>` if omitted. Branch defaults to repo default. **Idempotent** — if content matches what's already there, returns `{status: "unchanged"}` without making a no-op commit.
+- `delete_file` — Just give repo, path. Sha auto-fetched. Message auto-generated.
+- `create_branch` — Just give repo, name. Defaults to branching from repo default branch HEAD.
+- `move_file` — Rename or move a file in one tool call. Internally: read source, write to dest, delete source (two commits server-side, one tool call from the agent's perspective).
+
+**REST endpoints (parallel to MCP tools):**
+- `POST /api/github/file` — write_file
+- `DELETE /api/github/file` — delete_file
+- `POST /api/github/branch` — create_branch
+- `POST /api/github/move` — move_file
+
+**Lazy-agent-friendly defaults — these fields are OPTIONAL:**
+
+| Field | Default if omitted |
+|---|---|
+| `message` | `[linksblue] <op> <path>` (e.g. "[linksblue] update CLAUDE.MD") |
+| `branch` | The repo's default branch |
+| `sha` | Auto-fetched from current state of the file |
+
+**Path normalization:** Leading/trailing slashes stripped automatically (`/foo/bar/` → `foo/bar`). Whitespace trimmed. Common agent gotcha eliminated.
+
+**Idempotency:** `write_file` compares new content against the current file (when one exists). If identical, no commit is made — returns `{status: "unchanged"}`. Safe to retry.
+
+**Allow-list modes (WRITE_ALLOWED_REPOS env var):**
+- `*` — any repo in `GITHUB_ORG` is writable (Dean's current setup)
+- `repo1,repo2,...` — only the listed repos
+- unset/empty — all writes return 403
+
+Bearer auth via `LINKSBLUE_WRITE_KEY` is the primary security gate; the allow-list is a second independent check.
+
 ---
 
 ## BRAND CASING REMINDER
@@ -112,12 +153,16 @@ If you find yourself about to write to `TRIADBLUE/linkblue` instead of `TRIADBLU
 
 ## DO NOT MODIFY (without an explicit prompt)
 
-- All nine `server.tool(...)` registrations inside `createMcpServer()` in `index.js`.
-- `ghHeaders()`, `ghFetch()` helpers in `index.js`.
+- All nine read `server.tool(...)` registrations inside `createMcpServer()` in `index.js`.
+- All four write `server.tool(...)` registrations: `write_file`, `delete_file`, `create_branch`, `move_file`.
+- `ghHeaders()`, `ghFetch()`, `ghPut()`, `ghDeleteContents()`, `ghPost()`, `ghGetFile()`, `ghGetSha()` helpers.
+- `normalizePath()`, `defaultMessage()` helpers.
+- `getAllowedRepos()`, `isRepoAllowed()`, `repoDenialReason()` allow-list functions.
+- `requireWriteKey()`, `requireAllowedRepo()`, `logWrite()` middleware.
 - `InMemoryEventStore` class.
 - `handleMcpPost`, `handleMcpGet`, `handleMcpDelete`, `handleMcpHead` handlers.
 - The `app.head/post/get/delete('/mcp', ...)` and `app.head/post/delete('/', ...)` MCP route mounts.
-- All `/api/github/*` REST endpoints.
+- All `/api/github/*` REST endpoints (read AND write).
 - `GITHUB_TOKEN` flow.
 - Existing CORS middleware.
 
@@ -159,6 +204,7 @@ Cowork scheduled task. Pulls `ai-archive`, rebuilds the index, detects drift bet
 | Date | Changes |
 |------|---------|
 | 2026-05-03 | **Phase 1 — Archive ingest endpoint added.** Builds on the prior 2.4 deploy (which already shipped `consoleblue-github-proxy` → `linksblue-github-proxy` rename and added `write_file`/`delete_file`/`create_branch` MCP tools). `package.json` `name` field changed to `"linksblue"`. New file `routes/archive-ingest.js` implements `POST /api/archive/ingest` with bearer auth (`ARCHIVE_API_KEY`), body validation (platform enum, ISO 8601 timestamps, non-empty `source_id`), GitHub code-search dedupe on `source_id`, and PUT-to-Contents-API commit to `TRIADBLUE/ai-archive` at path `YYYY/MM/DD-{platform}-{slug}.md`. `index.js` patched with one wiring line `app.use('/api/archive', require('./routes/archive-ingest'))` inserted before the health-check route — all existing GitHub MCP tools, REST endpoints, MCP session handling, and `/mcp` mounts left untouched. New root `README.md` documents the service, URLs, endpoints, env vars. New `CLAUDE.md` (this file) replaces the prior placeholder. Companion repo `TRIADBLUE/ai-archive` initialized with its own `README.md` documenting the folder structure and file format. (Prompt 05/01/2026-9, Gate 2.) |
+| 2026-05-03 | **v2.5 — write endpoints made lazy-agent-friendly.** Builds on v2.4. (1) `message` field is now optional on write_file, delete_file, move_file — defaults to `[linksblue] <op> <path>`. (2) Path normalization helper strips leading/trailing slashes and whitespace before any GitHub API call. (3) `write_file` now does an idempotency check: if the new content matches the current file's content, returns `{status: "unchanged"}` and does not make a no-op commit. (4) New tool `move_file` (and `POST /api/github/move`) renames/moves a file in one tool call — server does the read+write+delete sequence internally. (5) `WRITE_ALLOWED_REPOS=*` wildcard supported (any repo in the org). (6) MCP tool descriptions rewritten to be self-explanatory: each one tells the agent what's required vs auto-handled. (7) `ghGetFile()` helper introduced returning `{sha, content}` so the idempotency check doesn't add a round trip; `ghGetSha()` retained as a thin wrapper. Service version bumped 2.4 → 2.5. (Prompt 05/03/2026-12.) |
 
 **AGENTS: Update this section on every commit. Your work is not done until this changelog reflects it.**
 **AGENTS: All code changes go to `staging` branch. NEVER push to `main` directly.**

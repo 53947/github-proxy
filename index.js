@@ -83,20 +83,41 @@ async function ghPost(path, body) {
   return JSON.parse(text);
 }
 
-// Auto-fetch the current sha for an existing file (needed for update + delete).
-// Returns null if the file doesn't exist (so callers can distinguish create vs update).
-async function ghGetSha(repo, path, branch) {
+// Auto-fetch the current sha + content for an existing file. Returns
+// {sha, content} for files, null for missing, throws for directories.
+// Used by write_file (for sha + idempotency check) and delete_file (sha only).
+async function ghGetFile(repo, path, branch) {
   const ref = branch ? `?ref=${encodeURIComponent(branch)}` : '';
   const url = `${GITHUB_API}/repos/${GITHUB_ORG}/${repo}/contents/${path}${ref}`;
   const res = await fetch(url, { headers: ghHeaders() });
   if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`GitHub GET sha ${res.status}: ${body}`);
+    throw new Error(`GitHub GET ${res.status}: ${body}`);
   }
   const data = await res.json();
   if (Array.isArray(data)) throw new Error(`${path} is a directory, not a file`);
-  return data.sha;
+  return { sha: data.sha, content: Buffer.from(data.content, 'base64').toString('utf-8') };
+}
+
+// Backwards-compatible wrapper — old name returns just sha.
+async function ghGetSha(repo, path, branch) {
+  const f = await ghGetFile(repo, path, branch);
+  return f ? f.sha : null;
+}
+
+// --- Lazy-agent-friendly helpers ---
+
+// Strip leading / trailing slashes and whitespace. GitHub Contents API
+// rejects paths with leading slashes; common agent mistake.
+function normalizePath(p) {
+  if (typeof p !== 'string') return p;
+  return p.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+// Build a sensible default commit message if the caller didn't supply one.
+function defaultMessage(op, repo, path) {
+  return `[linksblue] ${op} ${path}`;
 }
 
 // --- Write-endpoint security: bearer auth + repo allow-list ---
@@ -293,67 +314,83 @@ function createMcpServer() {
 
   // --- WRITE TOOLS — gated by allow-list (NOT by bearer in MCP, since MCP transport handles auth at the connector layer) ---
 
-  server.tool('write_file', 'Create or update a file in a repo. Auto-fetches sha if file exists.', {
-    repo: z.string().describe('Repository name'),
-    path: z.string().describe('File path within the repo'),
-    content: z.string().describe('Plain UTF-8 file content (will be base64-encoded server-side)'),
-    message: z.string().describe('Commit message'),
-    branch: z.string().optional().describe('Branch to commit to (default: repo default branch)'),
-    sha: z.string().optional().describe('Sha of file being replaced. Auto-fetched if omitted.'),
+  server.tool('write_file', 'Create or update a file. DEFAULT TOOL FOR WRITING. Just give repo, path, content — sha is auto-fetched if the file exists, message defaults to "[linksblue] update <path>" if omitted, branch defaults to the repo default. Returns {status: created|updated|unchanged}. If content matches what is already there, returns "unchanged" without making a no-op commit.', {
+    repo: z.string().describe('Repository name (e.g. "triadblue.rulebook")'),
+    path: z.string().describe('File path. Leading slash is fine — it will be normalized.'),
+    content: z.string().describe('Plain UTF-8 file content. Base64 encoding is handled server-side.'),
+    message: z.string().optional().describe('Commit message. Defaults to "[linksblue] update <path>" or "create <path>".'),
+    branch: z.string().optional().describe('Branch to commit to. Defaults to the repo default branch.'),
+    sha: z.string().optional().describe('Sha of the file being replaced. Auto-fetched if omitted — leave empty unless you need to assert a specific version.'),
   }, async ({ repo, path, content, message, branch, sha }) => {
     if (!isRepoAllowed(repo)) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
     }
     try {
+      const normPath = normalizePath(path);
       let resolvedSha = sha;
-      if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+      let existingContent = null;
+      if (!resolvedSha) {
+        const existing = await ghGetFile(repo, normPath, branch);
+        if (existing) {
+          resolvedSha = existing.sha;
+          existingContent = existing.content;
+        }
+      }
+      // Idempotency: skip the commit if the content already matches.
+      if (existingContent !== null && existingContent === content) {
+        const ts = new Date().toISOString();
+        console.log(`[${ts}] WRITE write_file (mcp) repo=${repo} path=${normPath} unchanged`);
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'unchanged', path: normPath }, null, 2) }] };
+      }
+      const op = resolvedSha ? 'update' : 'create';
       const body = {
-        message,
+        message: message || defaultMessage(op, repo, normPath),
         content: Buffer.from(content, 'utf-8').toString('base64'),
       };
       if (resolvedSha) body.sha = resolvedSha;
       if (branch) body.branch = branch;
-      const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+      const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${normPath}`, body);
       const ts = new Date().toISOString();
-      console.log(`[${ts}] WRITE write_file (mcp) repo=${repo} path=${path} bytes=${Buffer.byteLength(content, 'utf-8')} sha=${result.commit.sha.slice(0,7)}`);
-      return { content: [{ type: 'text', text: JSON.stringify({ status: resolvedSha ? 'updated' : 'created', path: result.content.path, commit_sha: result.commit.sha }, null, 2) }] };
+      console.log(`[${ts}] WRITE write_file (mcp) repo=${repo} path=${normPath} bytes=${Buffer.byteLength(content, 'utf-8')} op=${op} sha=${result.commit.sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: resolvedSha ? 'updated' : 'created', path: result.content.path, sha: result.content.sha, commit_sha: result.commit.sha }, null, 2) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
     }
   });
 
-  server.tool('delete_file', 'Delete a file from a repo. Auto-fetches sha.', {
+  server.tool('delete_file', 'Delete a file. Just give repo, path. Sha is auto-fetched. Message defaults to "[linksblue] delete <path>" if omitted. Returns {status: deleted} or 404 if the file does not exist.', {
     repo: z.string().describe('Repository name'),
-    path: z.string().describe('File path within the repo'),
-    message: z.string().describe('Commit message'),
-    branch: z.string().optional().describe('Branch to delete from (default: repo default branch)'),
-    sha: z.string().optional().describe('Sha of file. Auto-fetched if omitted.'),
+    path: z.string().describe('File path. Leading slash is fine — it will be normalized.'),
+    message: z.string().optional().describe('Commit message. Defaults to "[linksblue] delete <path>".'),
+    branch: z.string().optional().describe('Branch to delete from. Defaults to the repo default branch.'),
+    sha: z.string().optional().describe('Sha of the file. Auto-fetched if omitted.'),
   }, async ({ repo, path, message, branch, sha }) => {
     if (!isRepoAllowed(repo)) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
     }
     try {
+      const normPath = normalizePath(path);
       let resolvedSha = sha;
-      if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+      if (!resolvedSha) resolvedSha = await ghGetSha(repo, normPath, branch);
       if (!resolvedSha) {
-        return { content: [{ type: 'text', text: JSON.stringify({ error: `file not found: ${path}` }) }], isError: true };
+        return { content: [{ type: 'text', text: JSON.stringify({ error: `file not found: ${normPath}` }) }], isError: true };
       }
-      const body = { message, sha: resolvedSha };
+      const body = { message: message || defaultMessage('delete', repo, normPath), sha: resolvedSha };
       if (branch) body.branch = branch;
-      const result = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
+      const result = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${normPath}`, body);
       const ts = new Date().toISOString();
-      console.log(`[${ts}] WRITE delete_file (mcp) repo=${repo} path=${path} sha=${result.commit.sha.slice(0,7)}`);
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'deleted', path, commit_sha: result.commit.sha }, null, 2) }] };
+      console.log(`[${ts}] WRITE delete_file (mcp) repo=${repo} path=${normPath} sha=${result.commit.sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'deleted', path: normPath, commit_sha: result.commit.sha }, null, 2) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
     }
   });
 
-  server.tool('create_branch', 'Create a new branch from another branch or sha', {
+  server.tool('create_branch', 'Create a new branch. Just give repo and the new branch name — defaults to branching off the repo default branch HEAD. Returns {status: created, branch, sha}.', {
     repo: z.string().describe('Repository name'),
     name: z.string().describe('New branch name'),
-    from_sha: z.string().optional().describe('Sha to branch from'),
-    from_branch: z.string().optional().describe('Branch to branch from (default: repo default branch)'),
+    from_sha: z.string().optional().describe('Specific sha to branch from. Optional.'),
+    from_branch: z.string().optional().describe('Branch to copy from. Defaults to repo default branch if both from_sha and from_branch are omitted.'),
   }, async ({ repo, name, from_sha, from_branch }) => {
     if (!isRepoAllowed(repo)) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
@@ -372,6 +409,46 @@ function createMcpServer() {
       const ts = new Date().toISOString();
       console.log(`[${ts}] WRITE create_branch (mcp) repo=${repo} branch=${name} from=${sha.slice(0,7)}`);
       return { content: [{ type: 'text', text: JSON.stringify({ status: 'created', branch: name, sha, ref: result.ref }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
+    }
+  });
+
+  server.tool('move_file', 'Rename or move a file in one tool call. Reads source, writes to destination, deletes source — TWO commits server-side, but the agent only calls one tool. Defaults to "[linksblue] move <from> -> <to>" message.', {
+    repo: z.string().describe('Repository name'),
+    from_path: z.string().describe('Current file path'),
+    to_path: z.string().describe('New file path'),
+    message: z.string().optional().describe('Commit message. Defaults to "[linksblue] move <from> -> <to>".'),
+    branch: z.string().optional().describe('Branch. Defaults to repo default.'),
+  }, async ({ repo, from_path, to_path, message, branch }) => {
+    if (!isRepoAllowed(repo)) {
+      return { content: [{ type: 'text', text: JSON.stringify({ error: repoDenialReason(repo) }) }], isError: true };
+    }
+    try {
+      const fromNorm = normalizePath(from_path);
+      const toNorm = normalizePath(to_path);
+      if (fromNorm === toNorm) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'from_path and to_path are identical after normalization' }) }], isError: true };
+      }
+      const source = await ghGetFile(repo, fromNorm, branch);
+      if (!source) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: `source file not found: ${fromNorm}` }) }], isError: true };
+      }
+      const msg = message || `[linksblue] move ${fromNorm} -> ${toNorm}`;
+      // Step 1: write to new location
+      const writeBody = {
+        message: `${msg} (write)`,
+        content: Buffer.from(source.content, 'utf-8').toString('base64'),
+      };
+      if (branch) writeBody.branch = branch;
+      const writeResult = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${toNorm}`, writeBody);
+      // Step 2: delete from old location
+      const deleteBody = { message: `${msg} (delete)`, sha: source.sha };
+      if (branch) deleteBody.branch = branch;
+      const deleteResult = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${fromNorm}`, deleteBody);
+      const ts = new Date().toISOString();
+      console.log(`[${ts}] WRITE move_file (mcp) repo=${repo} ${fromNorm} -> ${toNorm} write=${writeResult.commit.sha.slice(0,7)} delete=${deleteResult.commit.sha.slice(0,7)}`);
+      return { content: [{ type: 'text', text: JSON.stringify({ status: 'moved', from: fromNorm, to: toNorm, write_commit: writeResult.commit.sha, delete_commit: deleteResult.commit.sha }, null, 2) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }], isError: true };
     }
@@ -667,21 +744,34 @@ app.get('/api/github/lines', async (req, res) => {
 // --- WRITE REST endpoints (bearer-auth + repo-allow-list gated) ---
 
 app.post('/api/github/file', requireWriteKey, requireAllowedRepo, async (req, res) => {
-  const { repo, path, content, message, branch, sha } = req.body || {};
-  if (!repo || !path || content == null || !message) {
-    return res.status(400).json({ error: 'repo, path, content, message all required' });
+  const { repo, content, message, branch, sha } = req.body || {};
+  const path = normalizePath(req.body && req.body.path);
+  if (!repo || !path || content == null) {
+    return res.status(400).json({ error: 'repo, path, content all required (message is optional — defaults to "[linksblue] update <path>")' });
   }
   try {
     let resolvedSha = sha;
-    if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
+    let existingContent = null;
+    if (!resolvedSha) {
+      const existing = await ghGetFile(repo, path, branch);
+      if (existing) {
+        resolvedSha = existing.sha;
+        existingContent = existing.content;
+      }
+    }
+    if (existingContent !== null && existingContent === String(content)) {
+      logWrite('write_file', req, { op: 'unchanged' });
+      return res.json({ status: 'unchanged', path });
+    }
+    const op = resolvedSha ? 'update' : 'create';
     const body = {
-      message,
+      message: message || defaultMessage(op, repo, path),
       content: Buffer.from(String(content), 'utf-8').toString('base64'),
     };
     if (resolvedSha) body.sha = resolvedSha;
     if (branch) body.branch = branch;
     const result = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
-    logWrite('write_file', req, { commit_sha: result.commit.sha.slice(0, 7), op: resolvedSha ? 'update' : 'create' });
+    logWrite('write_file', req, { commit_sha: result.commit.sha.slice(0, 7), op });
     res.json({ status: resolvedSha ? 'updated' : 'created', path: result.content.path, sha: result.content.sha, commit_sha: result.commit.sha });
   } catch (err) {
     res.status(502).json({ error: err.message });
@@ -689,19 +779,47 @@ app.post('/api/github/file', requireWriteKey, requireAllowedRepo, async (req, re
 });
 
 app.delete('/api/github/file', requireWriteKey, requireAllowedRepo, async (req, res) => {
-  const { repo, path, message, branch, sha } = req.body || {};
-  if (!repo || !path || !message) {
-    return res.status(400).json({ error: 'repo, path, message all required' });
+  const { repo, message, branch, sha } = req.body || {};
+  const path = normalizePath(req.body && req.body.path);
+  if (!repo || !path) {
+    return res.status(400).json({ error: 'repo and path required (message is optional — defaults to "[linksblue] delete <path>")' });
   }
   try {
     let resolvedSha = sha;
     if (!resolvedSha) resolvedSha = await ghGetSha(repo, path, branch);
     if (!resolvedSha) return res.status(404).json({ error: `file not found: ${path}` });
-    const body = { message, sha: resolvedSha };
+    const body = { message: message || defaultMessage('delete', repo, path), sha: resolvedSha };
     if (branch) body.branch = branch;
     const result = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${path}`, body);
     logWrite('delete_file', req, { commit_sha: result.commit.sha.slice(0, 7) });
     res.json({ status: 'deleted', path, commit_sha: result.commit.sha });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post('/api/github/move', requireWriteKey, requireAllowedRepo, async (req, res) => {
+  const { repo, message, branch } = req.body || {};
+  const fromPath = normalizePath(req.body && req.body.from_path);
+  const toPath = normalizePath(req.body && req.body.to_path);
+  if (!repo || !fromPath || !toPath) {
+    return res.status(400).json({ error: 'repo, from_path, to_path all required' });
+  }
+  if (fromPath === toPath) {
+    return res.status(400).json({ error: 'from_path and to_path are identical after normalization' });
+  }
+  try {
+    const source = await ghGetFile(repo, fromPath, branch);
+    if (!source) return res.status(404).json({ error: `source file not found: ${fromPath}` });
+    const msg = message || `[linksblue] move ${fromPath} -> ${toPath}`;
+    const writeBody = { message: `${msg} (write)`, content: Buffer.from(source.content, 'utf-8').toString('base64') };
+    if (branch) writeBody.branch = branch;
+    const writeResult = await ghPut(`/repos/${GITHUB_ORG}/${repo}/contents/${toPath}`, writeBody);
+    const deleteBody = { message: `${msg} (delete)`, sha: source.sha };
+    if (branch) deleteBody.branch = branch;
+    const deleteResult = await ghDeleteContents(`/repos/${GITHUB_ORG}/${repo}/contents/${fromPath}`, deleteBody);
+    logWrite('move_file', req, { from: fromPath, to: toPath, write: writeResult.commit.sha.slice(0, 7), delete: deleteResult.commit.sha.slice(0, 7) });
+    res.json({ status: 'moved', from: fromPath, to: toPath, write_commit: writeResult.commit.sha, delete_commit: deleteResult.commit.sha });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -740,7 +858,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'linksblue-github-proxy',
-    version: '2.4',
+    version: '2.5',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
