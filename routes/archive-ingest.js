@@ -39,9 +39,29 @@ async function ghPut(path, body) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`GitHub PUT ${path} ${res.status}: ${text}`);
+    const err = new Error(`GitHub PUT ${path} ${res.status}: ${text}`);
+    err.statusCode = res.status;
+    err.body = text;
+    throw err;
   }
   return res.json();
+}
+
+async function ghGetFile(path) {
+  const res = await fetch(`${GITHUB_API}${path}`, { headers: ghHeaders() });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub GET ${path} ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  const content = Buffer.from(data.content, 'base64').toString('utf-8');
+  return { content, sha: data.sha };
+}
+
+function frontmatterSourceId(markdown) {
+  const m = markdown.match(/^source_id:\s*(.+)$/m);
+  return m ? m[1].trim() : null;
 }
 
 async function ghSearchSourceId(sourceId) {
@@ -194,13 +214,32 @@ router.post('/ingest', requireBearer, async (req, res) => {
     });
     const markdown = fm + buildBody(messages);
 
-    // Commit to ai-archive via GitHub Contents API
-    await ghPut(`/repos/${ARCHIVE_OWNER}/${ARCHIVE_REPO}/contents/${p.full}`, {
-      message: `archive: ${platform}/${slug} (${source_id})`,
-      content: Buffer.from(markdown, 'utf-8').toString('base64'),
-    });
-
-    return res.status(200).json({ status: 'created', path: p.full });
+    // Commit to ai-archive via GitHub Contents API.
+    // If the GitHub code search index lagged on the dedupe lookup above
+    // (same source_id committed by an earlier request, not yet indexed),
+    // the PUT here will return 422 because the file already exists.
+    // We fall back to an immediately-consistent Contents API read to
+    // resolve whether this is the same conversation (true duplicate) or
+    // a path collision between two different source_ids.
+    const archiveApiPath = `/repos/${ARCHIVE_OWNER}/${ARCHIVE_REPO}/contents/${p.full}`;
+    try {
+      await ghPut(archiveApiPath, {
+        message: `archive: ${platform}/${slug} (${source_id})`,
+        content: Buffer.from(markdown, 'utf-8').toString('base64'),
+      });
+      return res.status(200).json({ status: 'created', path: p.full });
+    } catch (putErr) {
+      if (putErr.statusCode !== 422) throw putErr;
+      const existing = await ghGetFile(archiveApiPath);
+      if (existing && frontmatterSourceId(existing.content) === source_id) {
+        return res.status(200).json({ status: 'duplicate', path: p.full });
+      }
+      return res.status(409).json({
+        error: 'path collision: a different conversation already occupies this path',
+        path: p.full,
+        hint: 'two distinct source_ids slugified to the same path; rename or add a discriminator to the conversation title',
+      });
+    }
   } catch (err) {
     console.error('[archive-ingest] error:', err);
     return res.status(500).json({ error: err && err.message ? err.message : 'internal error' });
