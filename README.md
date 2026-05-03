@@ -33,7 +33,67 @@ Tools exposed: `list_repos`, `get_repo`, `list_files`, `read_file`, `list_branch
 
 ### Archive ingest
 
-- `POST /api/archive/ingest` — receives conversation captures from the linksblue capture daemon and commits each one as a markdown file to `TRIADBLUE/ai-archive`. Bearer auth required: `Authorization: Bearer <ARCHIVE_API_KEY>`. Returns `{ status: "created", path }` on first ingest, `{ status: "duplicate", path }` if `source_id` already exists in the archive.
+`POST /api/archive/ingest` — receives conversation captures and commits each one as a markdown file to `TRIADBLUE/ai-archive`. Bearer auth required: `Authorization: Bearer <ARCHIVE_API_KEY>`.
+
+Two request modes, distinguished by which fields are present:
+
+**Mode A — single-shot capture** (legacy, backward compatible). Send a complete conversation in one POST.
+
+```
+curl -X POST https://github.linksblue.network/api/archive/ingest \
+  -H "Authorization: Bearer $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "claude_code",
+    "title": "Build session",
+    "started_at": "2026-05-03T18:00:00Z",
+    "ended_at": "2026-05-03T19:30:00Z",
+    "source_id": "session-abc-123",
+    "messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+  }'
+```
+
+Returns `{"status": "created", "path": "..."}` on first ingest, `{"status": "duplicate", "path": "..."}` if the same `source_id` was already committed.
+
+**Mode B — snapshot/append**. Send incremental snapshots of a still-evolving conversation. The first snapshot for a `source_id` creates the file; subsequent snapshots append the new messages.
+
+```
+curl -X POST https://github.linksblue.network/api/archive/ingest \
+  -H "Authorization: Bearer $ARCHIVE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "platform": "claude_web",
+    "title": "Live session",
+    "started_at": "2026-05-03T20:00:00Z",
+    "last_updated": "2026-05-03T20:15:00Z",
+    "source_id": "session-xyz-789",
+    "from_index": 0,
+    "new_messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+  }'
+```
+
+Response shapes:
+- `{"status": "created", "path": "...", "snapshot_count": 1, "message_count": N}` — first snapshot.
+- `{"status": "appended", "path": "...", "snapshot_count": K, "message_count": N, "appended": M}` — subsequent snapshot.
+- `{"status": "no_change", ...}` — retry of an already-applied snapshot, no new messages.
+- `409 {"error": "snapshot gap detected", "expected_from_index": N, "got_from_index": M, ...}` — `from_index` ahead of the archive (daemon state ahead of server state). Send a reconciliation snapshot starting at `expected_from_index` with the missing messages.
+
+Field reference:
+
+| Field | Mode A | Mode B | Notes |
+|------|--------|--------|-------|
+| `platform` | required | required | Enum: `claude_code`, `claude_web`, `claude_desktop`, `cowork` |
+| `title` | required | required | Latest snapshot's title wins on append |
+| `started_at` | required | required | ISO 8601; never overwritten after first POST |
+| `source_id` | required | required | Unique ID from the source system |
+| `ended_at` | required | — | ISO 8601 (Mode A only) |
+| `messages` | required | — | Full message array (Mode A only) |
+| `last_updated` | — | required | ISO 8601, refreshed every snapshot (Mode B) |
+| `from_index` | — | required | Integer; index this snapshot's `new_messages` start at (Mode B) |
+| `new_messages` | — | required | Messages added since last snapshot (Mode B) |
+| `metadata` | optional | optional | Free-form object |
+
+Mode is detected by which mutually-exclusive field set is present. If both `messages`+`ended_at` AND `new_messages`+`from_index` are sent, the request is rejected with 400.
 
 ### Health
 
@@ -63,3 +123,4 @@ Tools exposed: `list_repos`, `get_repo`, `list_files`, `read_file`, `list_branch
 
 - `CLAUDE.md` — agent instructions for working in this repo. Read before any code change.
 - TRIADBLUE Universal Brand Rules — `TRIADBLUE/triadblue.rulebook/CLAUDE.MD` (private; public mirror at `TRIADBLUE/.github/CLAUDE.MD`).
+
