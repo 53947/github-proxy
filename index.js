@@ -217,10 +217,13 @@ function buildPromptRow({ id, type, dateISO, title, platform, agent, status, com
 }
 
 function insertRowAtTopOfLog(content, newRow) {
-  // The header separator row is the unique anchor — insert immediately after it.
-  const sepRegex = /(\| --- \| --- \| --- \| --- \| --- \| --- \| --- \| --- \| --- \|\n)/;
+  // The 9-cell separator row is the unique anchor (the smaller CLAIM ENDPOINTS
+  // table at the top of PROMPT_LOG.md has only 2 cells, so it can't match).
+  // Tolerates any amount of whitespace and any dash count per cell, so the
+  // markdown can be formatted as `|---|` or `| --- |` or anywhere in between.
+  const sepRegex = /(\|(?:\s*-+\s*\|){9}[ \t]*\n)/;
   if (!sepRegex.test(content)) {
-    throw new Error('PROMPT_LOG.md does not contain the expected table separator row');
+    throw new Error('PROMPT_LOG.md does not contain the expected 9-cell table separator row');
   }
   return content.replace(sepRegex, `$1${newRow}\n`);
 }
@@ -1575,7 +1578,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'linksblue-github-proxy',
-    version: '2.7',
+    version: '2.8',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
