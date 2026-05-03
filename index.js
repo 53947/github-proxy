@@ -728,6 +728,9 @@ app.post('/api/github/branch', requireWriteKey, requireAllowedRepo, async (req, 
   }
 });
 
+// --- Archive ingest endpoint ---
+app.use('/api/archive', require('./routes/archive-ingest'));
+
 // --- GET / without session header = health check ---
 app.get('/', (req, res) => {
   const sessionId = getSessionId(req);
@@ -746,3 +749,4 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Proxy + MCP server running on port ${PORT}`);
 });
+
