@@ -155,15 +155,30 @@ async function pushFilesAtomic(repo, files, message, branch) {
   };
 }
 
-// --- v2.7: PROMPT LOG operations (atomic claim + lifecycle) ---
+// --- v2.7+TTL: PROMPT LOG operations (atomic claim + lifecycle + 7-day TTL on `claimed`) ---
 // Storage: TRIADBLUE/ai-archive/PROMPT_LOG.md
 // Concurrency: optimistic (read sha, modify, conditional PUT, retry up to 3x)
+//
+// TTL behavior (added by Prompt 05/04/2026-22 — CLAIM_TTL_AND_EXPIRY):
+//   - Claims with status=`claimed` and a parseable `claimed_at` ISO timestamp
+//     auto-expire when (now - claimed_at) > 7 days.
+//   - Expiry sweep is LAZY — runs at the start of every claim-number,
+//     claim-response, and prompt-status call. No scheduled task.
+//   - When the sweep changes any row, it commits PROMPT_LOG.md before the
+//     endpoint's main commit. Two commits on expiration runs; one otherwise.
+//   - Expired numbers are NEVER reissued. nextN advances past them.
+//   - Historical rows without claimed_at are immune (sweep skips them).
+//   - PATCH targeting an `expired` row returns 409 (cannot transition).
 
 const ARCHIVE_REPO = 'ai-archive';
 const PROMPT_LOG_PATH = 'PROMPT_LOG.md';
 const MAX_CLAIM_RETRIES = 3;
+const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function parseHighestN(content) {
+  // Scans the entire file for MM/DD/YYYY-N patterns and returns max N.
+  // This naturally includes `expired` rows (which retain their ID), so
+  // expired numbers are never reissued — the next claim is always max+1.
   let max = 0;
   const re = /\d{2}\/\d{2}\/\d{4}-(\d+)/g;
   let m;
@@ -212,18 +227,25 @@ function todayISODate() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function buildPromptRow({ id, type, dateISO, title, platform, agent, status, commitSha, note }) {
-  return `| ${id} | ${type} | ${dateISO} | ${title || ''} | ${platform || ''} | ${agent || ''} | ${status} | ${commitSha || '—'} | ${note || ''} |`;
+// Builds a PROMPT_LOG row. If `claimedAt` is provided, emits the 10-column
+// schema (with Claimed At cell between Commit SHA and Note). If omitted,
+// emits the legacy 9-column schema for backward compatibility.
+function buildPromptRow({ id, type, dateISO, title, platform, agent, status, commitSha, note, claimedAt }) {
+  const base = `| ${id} | ${type} | ${dateISO} | ${title || ''} | ${platform || ''} | ${agent || ''} | ${status} | ${commitSha || '—'}`;
+  if (claimedAt) {
+    return `${base} | ${claimedAt} | ${note || ''} |`;
+  }
+  return `${base} | ${note || ''} |`;
 }
 
 function insertRowAtTopOfLog(content, newRow) {
-  // The 9-cell separator row is the unique anchor (the smaller CLAIM ENDPOINTS
-  // table at the top of PROMPT_LOG.md has only 2 cells, so it can't match).
-  // Tolerates any amount of whitespace and any dash count per cell, so the
-  // markdown can be formatted as `|---|` or `| --- |` or anywhere in between.
-  const sepRegex = /(\|(?:\s*-+\s*\|){9}[ \t]*\n)/;
+  // The 9-or-10-cell separator row anchors the LOG table (the smaller
+  // CLAIM ENDPOINTS table at the top of PROMPT_LOG.md has only 2 cells,
+  // so it can't match). Tolerates 9 cells (legacy) or 10 cells (with
+  // Claimed At column).
+  const sepRegex = /(\|(?:\s*-+\s*\|){9,10}[ \t]*\n)/;
   if (!sepRegex.test(content)) {
-    throw new Error('PROMPT_LOG.md does not contain the expected 9-cell table separator row');
+    throw new Error('PROMPT_LOG.md does not contain the expected 9- or 10-cell table separator row');
   }
   return content.replace(sepRegex, `$1${newRow}\n`);
 }
@@ -232,19 +254,56 @@ function updateNextNumberLine(content, nextN) {
   return content.replace(/The next PROMPT or SEGUE will be N=\d+\./, `The next PROMPT or SEGUE will be N=${nextN}.`);
 }
 
+// Detects whether a parsed row uses the legacy 9-column schema or the new
+// 10-column schema (with Claimed At). split('|') yields [empty, ..cols.., empty]
+// so 9 data columns → 11 array elements, 10 data columns → 12 elements.
+function rowHasClaimedAtColumn(cols) {
+  return cols.length >= 12;
+}
+
+// Parses a markdown row into a structured object. Returns null for non-rows.
+// Handles both 9-column legacy rows (claimed_at = null) and 10-column rows.
+function parseLogRow(line) {
+  if (!line || !line.startsWith('|')) return null;
+  const cols = line.split('|').map(s => s.trim());
+  // Either ['', id, type, date, title, platform, agent, status, sha, note, '']  (legacy, 11)
+  // or     ['', id, type, date, title, platform, agent, status, sha, claimed_at, note, '']  (new, 12)
+  if (cols.length < 11) return null;
+  // Reject the header / separator rows (their "id" cell is "ID" or all dashes)
+  if (cols[1] === 'ID' || /^-+$/.test(cols[1])) return null;
+  const has = rowHasClaimedAtColumn(cols);
+  return {
+    id: cols[1],
+    type: cols[2],
+    date: cols[3],
+    title: cols[4],
+    platform: cols[5],
+    agent: cols[6],
+    status: cols[7],
+    commitSha: cols[8],
+    claimedAt: has ? cols[9] : null,
+    note: has ? cols[10] : cols[9],
+    has_claimed_at: has,
+  };
+}
+
+// Updates a row's status (and optionally commit_sha and note). Handles both
+// legacy 9-column and new 10-column rows. Returns the new content or null if
+// the row wasn't found.
 function updateRowStatus(content, id, newStatus, commitSha, note) {
   const lines = content.split('\n');
   let modified = false;
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].startsWith(`| ${id} |`)) continue;
     const cols = lines[i].split('|').map(s => s.trim());
-    // ['', id, type, date, title, platform, agent, status, commit_sha, note, '']
     if (cols.length < 11) continue;
+    const has = rowHasClaimedAtColumn(cols);
+    const noteIdx = has ? 10 : 9;
     cols[7] = newStatus;
     if (commitSha !== undefined && commitSha !== null) cols[8] = commitSha;
     if (note !== undefined && note !== null && note !== '') {
-      const oldNote = cols[9] || '';
-      cols[9] = oldNote && oldNote !== '' ? `${oldNote}; ${note}` : note;
+      const oldNote = cols[noteIdx] || '';
+      cols[noteIdx] = oldNote && oldNote !== '' ? `${oldNote}; ${note}` : note;
     }
     lines[i] = '| ' + cols.slice(1, -1).join(' | ') + ' |';
     modified = true;
@@ -253,17 +312,66 @@ function updateRowStatus(content, id, newStatus, commitSha, note) {
   return modified ? lines.join('\n') : null;
 }
 
+// --- TTL: lazy expiry sweep ---
+
+// Pure function: given the current PROMPT_LOG content, returns
+// { changed, newContent, expiredIds }. Does NOT commit.
+function sweepExpiredClaims(content) {
+  const now = Date.now();
+  const lines = content.split('\n');
+  const expiredIds = [];
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const row = parseLogRow(lines[i]);
+    if (!row) continue;
+    if (row.status !== 'claimed') continue;
+    if (!row.has_claimed_at || !row.claimedAt) continue; // historical rows immune
+    const claimedTime = Date.parse(row.claimedAt);
+    if (Number.isNaN(claimedTime)) continue; // malformed timestamp, leave alone
+    if (now - claimedTime <= CLAIM_TTL_MS) continue; // still fresh
+    // Expire this row
+    const cols = lines[i].split('|').map(s => s.trim());
+    cols[7] = 'expired';
+    const noteIdx = 10; // 10-col rows always have noteIdx=10
+    const oldNote = cols[noteIdx] || '';
+    const expireNote = `auto-expired ${new Date(now).toISOString()}`;
+    cols[noteIdx] = oldNote && oldNote !== '' ? `${oldNote}; ${expireNote}` : expireNote;
+    lines[i] = '| ' + cols.slice(1, -1).join(' | ') + ' |';
+    expiredIds.push(row.id);
+    changed = true;
+  }
+  return { changed, newContent: lines.join('\n'), expiredIds };
+}
+
+// If the current file has any expirable claims, commits the sweep and
+// returns the new file ref ({ sha, content }). Otherwise returns the
+// original file ref unchanged.
+async function maybeSweepAndCommit(file) {
+  const sweep = sweepExpiredClaims(file.content);
+  if (!sweep.changed) return file;
+  const result = await ghPut(`/repos/${GITHUB_ORG}/${ARCHIVE_REPO}/contents/${PROMPT_LOG_PATH}`, {
+    message: `Auto-expire stale claims: ${sweep.expiredIds.join(', ')}`,
+    content: Buffer.from(sweep.newContent, 'utf-8').toString('base64'),
+    sha: file.sha,
+  });
+  return { sha: result.content.sha, content: sweep.newContent };
+}
+
 function isShaConflict(err) {
   const msg = (err && err.message) || '';
   return /\b(409|422)\b/.test(msg) || /does not match/i.test(msg) || /sha/i.test(msg) && /match/i.test(msg);
 }
 
+// --- atomic operations ---
+
 async function claimNumberAtomic({ type, platform, agent, title, coversPrompts }) {
   let lastErr;
   for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
     try {
-      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      let file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
       if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      // Lazy expiry sweep — may produce a separate commit before our claim commit.
+      file = await maybeSweepAndCommit(file);
       const { sha, content } = file;
       const highestN = parseHighestN(content);
       const nextN = highestN + 1;
@@ -273,12 +381,14 @@ async function claimNumberAtomic({ type, platform, agent, title, coversPrompts }
       if (type === 'SEGUE' && coversPrompts && coversPrompts.length) {
         note = `covers: ${coversPrompts.join(', ')}`;
       }
+      const claimedAt = new Date().toISOString();
       const row = buildPromptRow({
         id, type,
         dateISO: todayISODate(),
         title, platform, agent,
         status: 'claimed',
         note,
+        claimedAt,
       });
       let newContent = insertRowAtTopOfLog(content, row);
       newContent = updateNextNumberLine(newContent, nextN + 1);
@@ -287,7 +397,7 @@ async function claimNumberAtomic({ type, platform, agent, title, coversPrompts }
         content: Buffer.from(newContent, 'utf-8').toString('base64'),
         sha,
       });
-      return { n: nextN, date, id, type, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
+      return { n: nextN, date, id, type, claimed_at: claimedAt, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
     } catch (err) {
       lastErr = err;
       if (isShaConflict(err)) continue;
@@ -301,18 +411,21 @@ async function claimResponseAtomic({ parentN, parentDate, platform, agent, title
   let lastErr;
   for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
     try {
-      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      let file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
       if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      file = await maybeSweepAndCommit(file);
       const { sha, content } = file;
       const existing = findResponsesForParent(content, parentDate, parentN);
       const next = existing.length ? nextAlphabetic(highestLetterFrom(existing)) : 'a';
       const id = `${parentDate}-${parentN}${next}`;
+      const claimedAt = new Date().toISOString();
       const row = buildPromptRow({
         id, type: 'RESPONSE',
         dateISO: todayISODate(),
         title, platform, agent,
         status: 'claimed',
         note: `parent: ${parentDate}-${parentN}`,
+        claimedAt,
       });
       const newContent = insertRowAtTopOfLog(content, row);
       const result = await ghPut(`/repos/${GITHUB_ORG}/${ARCHIVE_REPO}/contents/${PROMPT_LOG_PATH}`, {
@@ -320,7 +433,7 @@ async function claimResponseAtomic({ parentN, parentDate, platform, agent, title
         content: Buffer.from(newContent, 'utf-8').toString('base64'),
         sha,
       });
-      return { letter: next, parent: `${parentDate}-${parentN}`, id, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
+      return { letter: next, parent: `${parentDate}-${parentN}`, id, claimed_at: claimedAt, log_sha: result.content.sha, log_commit_sha: result.commit.sha };
     } catch (err) {
       lastErr = err;
       if (isShaConflict(err)) continue;
@@ -334,13 +447,27 @@ async function updatePromptStatusAtomic({ id, status, commitSha, note }) {
   let lastErr;
   for (let attempt = 0; attempt < MAX_CLAIM_RETRIES; attempt++) {
     try {
-      const file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
+      let file = await ghGetFile(ARCHIVE_REPO, PROMPT_LOG_PATH);
       if (!file) throw new Error(`${PROMPT_LOG_PATH} not found in ${ARCHIVE_REPO}`);
+      file = await maybeSweepAndCommit(file);
       const { sha, content } = file;
       if (!content.includes(`| ${id} |`)) {
         const err = new Error(`row not found: ${id}`);
         err.notFound = true;
         throw err;
+      }
+      // Reject transitions on `expired` rows (TTL has retired the number).
+      const lines = content.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith(`| ${id} |`)) continue;
+        const row = parseLogRow(line);
+        if (row && row.status === 'expired') {
+          const err = new Error('cannot transition expired claim');
+          err.expired = true;
+          err.expiredId = id;
+          throw err;
+        }
+        break;
       }
       const newContent = updateRowStatus(content, id, status, commitSha, note);
       if (newContent === null) throw new Error(`row not modified: ${id}`);
@@ -352,7 +479,7 @@ async function updatePromptStatusAtomic({ id, status, commitSha, note }) {
       return { status: 'updated', id, new_status: status, log_commit_sha: result.commit.sha };
     } catch (err) {
       lastErr = err;
-      if (err.notFound) throw err;
+      if (err.notFound || err.expired) throw err;
       if (isShaConflict(err)) continue;
       throw err;
     }
