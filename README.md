@@ -95,6 +95,26 @@ Field reference:
 
 Mode is detected by which mutually-exclusive field set is present. If both `messages`+`ended_at` AND `new_messages`+`from_index` are sent, the request is rejected with 400.
 
+### Prompt-log claim endpoints
+
+These endpoints atomically read/write `TRIADBLUE/ai-archive/PROMPT_LOG.md` — the canonical ledger of every numbered PROMPT, RESPONSE, and SEGUE in the ecosystem. All gated by `Authorization: Bearer <LINKSBLUE_WRITE_KEY>`.
+
+- `POST /api/archive/claim-number` — claims the next sequential N for a `PROMPT` or `SEGUE`. Body: `{type, platform, agent, title, covers_prompts?}`. Writes a new row with `status: claimed` and `claimed_at: <ISO 8601>`. Returns `{n, date, id, type, claimed_at, log_sha, log_commit_sha}`.
+- `POST /api/archive/claim-response` — claims the next response letter (`a`, `b`, ...) under a parent prompt. Body: `{parent_n, parent_date, platform, agent, title}`.
+- `PATCH /api/archive/prompt-status` — moves a row through the lifecycle `claimed → fired → committed → verified` (or `→ abandoned`). Body: `{id, status, commit_sha?, note?}`.
+
+**TTL — claims auto-expire after 7 days** (added 2026-05-04 in Prompt 05/04/2026-22). On every claim/response/status call, the server runs a lazy sweep that transitions any row with `status: claimed` AND `claimed_at` older than 7 days to a new terminal status `expired`. The sweep produces a separate commit (`Auto-expire stale claims: <ids>`) before the endpoint's main commit.
+
+Expired numbers are **retired permanently**. The next claim always advances past them — there is no reissue or reactivate path. If work was abandoned and you want to revive it, claim a fresh number with the same title; the expired row stays as a tombstone.
+
+PATCH-ing an `expired` row returns:
+
+```
+409 {"error": "cannot transition expired claim", "hint": "this number was retired by TTL; claim a new number"}
+```
+
+Historical rows in `PROMPT_LOG.md` written before the TTL change have no `claimed_at` field and are **immune** to the sweep — only rows with a parseable timestamp are eligible for expiry.
+
 ### Health
 
 - `GET /` (no MCP session header) — service status JSON.
