@@ -131,7 +131,7 @@ Historical rows in `PROMPT_LOG.md` written before the TTL change have no `claime
 |------|---------|
 | `GITHUB_TOKEN` | GitHub PAT used by the proxy and archive ingest. Needs read on TRIADBLUE org and write on `TRIADBLUE/ai-archive`. |
 | `GITHUB_ORG` | Defaults to `TRIADBLUE`. |
-| `ARCHIVE_API_KEY` | Bearer token required by `POST /api/archive/ingest`. Single-user auth. Mirrored in macOS Keychain on Dean's Mac at service `linksblue-archive-api-key`. |
+| `ARCHIVE_API_KEY` | Bearer token required by `POST /api/archive/ingest`. Single-user auth. Mirrored in macOS Keychain on Dean's Mac at service `LINKSBLUE_ARCHIVE_API_KEY`. |
 | `PORT` | Defaults to 3000; Railway uses 8080 via the public-domain port mapping. |
 
 ## Companion projects

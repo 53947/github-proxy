@@ -30,13 +30,13 @@ NODE_PATH="$(command -v node)"
 echo "==> node: v$NODE_VER at $NODE_PATH"
 
 # 2. Verify Keychain entry exists
-if ! security find-generic-password -s linksblue-archive-api-key >/dev/null 2>&1; then
-    echo "ERROR: Keychain entry 'linksblue-archive-api-key' not found." >&2
+if ! security find-generic-password -s LINKSBLUE_ARCHIVE_API_KEY >/dev/null 2>&1; then
+    echo "ERROR: Keychain entry 'LINKSBLUE_ARCHIVE_API_KEY' not found." >&2
     echo "  Add it with:" >&2
-    echo "    security add-generic-password -s linksblue-archive-api-key -a deanlewis -w 'YOUR_KEY'" >&2
+    echo "    security add-generic-password -s LINKSBLUE_ARCHIVE_API_KEY -a deanlewis -w 'YOUR_KEY'" >&2
     exit 1
 fi
-echo "==> Keychain entry linksblue-archive-api-key found"
+echo "==> Keychain entry LINKSBLUE_ARCHIVE_API_KEY found"
 
 # 3. Verify watch paths (warn-but-allow if any missing)
 WATCH_PATHS=(

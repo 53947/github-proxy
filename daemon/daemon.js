@@ -61,14 +61,14 @@ function logError(...parts) {
 
 function loadKey() {
   try {
-    const key = execSync('security find-generic-password -s linksblue-archive-api-key -w', { encoding: 'utf-8' }).trim();
+    const key = execSync('security find-generic-password -s LINKSBLUE_ARCHIVE_API_KEY -w', { encoding: 'utf-8' }).trim();
     if (!key) {
-      logError('Keychain entry linksblue-archive-api-key returned empty value');
+      logError('Keychain entry LINKSBLUE_ARCHIVE_API_KEY returned empty value');
       process.exit(1);
     }
     return key;
   } catch (err) {
-    logError('Cannot read API key from Keychain (linksblue-archive-api-key):', err.message);
+    logError('Cannot read API key from Keychain (LINKSBLUE_ARCHIVE_API_KEY):', err.message);
     process.exit(1);
   }
 }

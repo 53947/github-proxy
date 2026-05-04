@@ -51,7 +51,7 @@ nested deeper are intentionally skipped.
 
 ## How it works
 
-1. Read API key from macOS Keychain (`linksblue-archive-api-key`).
+1. Read API key from macOS Keychain (`LINKSBLUE_ARCHIVE_API_KEY`).
 2. Load state from `~/.linksblue-daemon/state.json`.
 3. Every 15 minutes:
    - Drain the failure queue first (any deltas that couldn't post on
@@ -75,10 +75,10 @@ cd /Users/deanlewis/linksblue-network/daemon
 The installer:
 
 - Verifies Node 18+ is available.
-- Verifies the Keychain entry `linksblue-archive-api-key` exists. If
+- Verifies the Keychain entry `LINKSBLUE_ARCHIVE_API_KEY` exists. If
   not, run:
   ```bash
-  security add-generic-password -s linksblue-archive-api-key -a deanlewis -w 'YOUR_KEY'
+  security add-generic-password -s LINKSBLUE_ARCHIVE_API_KEY -a deanlewis -w 'YOUR_KEY'
   ```
   before re-running install.
 - Verifies (warns if missing) the three watch paths.
@@ -133,7 +133,7 @@ picks up where it left off.
 ## Multi-machine setup
 
 Each machine needs its own Keychain entry. Add it with
-`security add-generic-password -s linksblue-archive-api-key -a deanlewis -w 'YOUR_KEY'`
+`security add-generic-password -s LINKSBLUE_ARCHIVE_API_KEY -a deanlewis -w 'YOUR_KEY'`
 **before** running `install.sh` on a new machine.
 
 If you sign in to claude.ai on multiple machines, each machine's
