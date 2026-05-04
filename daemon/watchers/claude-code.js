@@ -5,10 +5,16 @@
 //
 // Captures user/assistant messages only. Skips system/tool-use noise
 // (matches the role mapping the ingest endpoint expects).
+//
+// Note: Cowork sandbox transcripts use the same JSONL format but live
+// under ~/Library/Application Support/Claude/local-agent-mode-sessions/.
+// They are NOT under ~/.claude/projects/ and are handled by cowork.js
+// — disjoint roots, no double-capture risk.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { parseJsonlFile } = require('../lib/jsonl-parser');
 
 const ROOT = path.join(os.homedir(), '.claude', 'projects');
 
@@ -21,48 +27,6 @@ function walk(dir) {
     else if (entry.isFile() && entry.name.endsWith('.jsonl')) out.push(full);
   }
   return out;
-}
-
-function extractText(content) {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .map(part => {
-        if (typeof part === 'string') return part;
-        if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
-        return null;
-      })
-      .filter(Boolean)
-      .join('\n');
-  }
-  if (content && typeof content === 'object' && typeof content.text === 'string') return content.text;
-  return null;
-}
-
-function parseFile(filepath) {
-  const messages = [];
-  let firstTimestamp = null;
-  let titleCandidate = null;
-  const raw = fs.readFileSync(filepath, 'utf-8');
-  const lines = raw.split('\n');
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let entry;
-    try { entry = JSON.parse(line); } catch { continue; }
-    const role = entry.type || entry.role;
-    if (role !== 'user' && role !== 'assistant') continue;
-    const text = extractText(entry.message?.content ?? entry.content);
-    if (!text) continue;
-    const ts = entry.timestamp || entry.time || entry.created_at || null;
-    if (ts && !firstTimestamp) firstTimestamp = ts;
-    if (role === 'user' && !titleCandidate) titleCandidate = text.slice(0, 80).replace(/\s+/g, ' ').trim();
-    messages.push({
-      role,
-      content: text,
-      timestamp: ts || undefined,
-    });
-  }
-  return { messages, firstTimestamp, titleCandidate };
 }
 
 module.exports = async function claudeCodeWatcher(state, log) {
@@ -80,7 +44,7 @@ module.exports = async function claudeCodeWatcher(state, log) {
       const existing = state.conversations[sourceId];
       if (existing && existing.active === false) continue;
 
-      const { messages, firstTimestamp, titleCandidate } = parseFile(filepath);
+      const { messages, firstTimestamp, titleCandidate } = parseJsonlFile(filepath);
       if (messages.length === 0) continue;
 
       const lastIndex = existing?.last_message_index ?? 0;

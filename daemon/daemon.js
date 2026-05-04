@@ -29,7 +29,8 @@ const STATE_DIR = path.join(HOME, '.linksblue-daemon');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const QUEUE_DIR = path.join(STATE_DIR, 'queue');
 const PARSE_FAILURE_DIR = path.join(STATE_DIR, 'parse-failures');
-const LOG_FILE = path.join(STATE_DIR, 'daemon.log');
+// daemon.log path is owned by the LaunchAgent plist (StandardOutPath /
+// StandardErrorPath). Don't redeclare it here — see logger comments below.
 
 // Throttle for repeated GitHub-issue creation on parse failures.
 const ISSUE_THROTTLE_MS = 24 * 60 * 60 * 1000;
@@ -41,22 +42,21 @@ function ensureDirs() {
   }
 }
 
-// Logger writes to file AND stdout (which LaunchAgent also captures to file).
+// Logger writes to stdout/stderr only. The LaunchAgent plist redirects
+// both StandardOutPath and StandardErrorPath to LOG_FILE, so console.log
+// and console.error already land in daemon.log. Writing the same line via
+// appendFileSync as well caused every line to appear twice.
 // Never log the API key.
 function timestamp() {
   return new Date().toISOString();
 }
 
 function logInfo(...parts) {
-  const line = `[${timestamp()}] INFO ${parts.join(' ')}`;
-  console.log(line);
-  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) {}
+  console.log(`[${timestamp()}] INFO ${parts.join(' ')}`);
 }
 
 function logError(...parts) {
-  const line = `[${timestamp()}] ERROR ${parts.join(' ')}`;
-  console.error(line);
-  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) {}
+  console.error(`[${timestamp()}] ERROR ${parts.join(' ')}`);
 }
 
 function loadKey() {

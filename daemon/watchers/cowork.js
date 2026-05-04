@@ -1,54 +1,67 @@
 // watchers/cowork.js
 //
 // Walks ~/Library/Application Support/Claude/local-agent-mode-sessions/.
-// Each session is a JSON file. Format may have messages either at the
-// top level or nested under a "messages" / "conversation" key — we
-// inspect at runtime and adapt.
+// Cowork is essentially Claude Code running inside a per-session sandbox,
+// so the transcripts have the same JSONL format as ~/.claude/projects/.
+//
+// On-disk layout:
+//   local-agent-mode-sessions/
+//     <workspace-uuid>/
+//       <session-group-uuid>/
+//         local_<uuid>/                              <-- one Cowork session
+//           .claude/
+//             projects/
+//               <derived-project-name>/
+//                 <session-id>.jsonl                 <-- main transcript
+//                 <session-id>/
+//                   subagents/agent-<id>.jsonl       <-- subagent (skipped)
+//             sessions/, tasks/
+//           outputs/, shim-perm/
+//
+// source_id = the `local_<uuid>` directory name (one Cowork session = one
+// archive file). Subagent JSONLs are skipped — only the main transcript is
+// captured. If a single local_<uuid> contains multiple main JSONLs (rare
+// — e.g. session resumed with a new id), the most-recently-modified file
+// wins.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { parseJsonlFile } = require('../lib/jsonl-parser');
 
 const ROOT = path.join(os.homedir(), 'Library', 'Application Support', 'Claude', 'local-agent-mode-sessions');
+const LOCAL_UUID_RE = /^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function walk(dir) {
+// Walk recursively and collect every .jsonl whose path matches:
+//   <root>/<workspace>/<group>/local_<uuid>/.claude/projects/<project>/<file>.jsonl
+// Excludes anything deeper (subagents, nested session dirs).
+function findMainSessionJsonls(root) {
   const out = [];
-  if (!fs.existsSync(dir)) return out;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walk(full));
-    else if (entry.isFile() && entry.name.endsWith('.json')) out.push(full);
+  if (!fs.existsSync(root)) return out;
+
+  function recurse(dir, ancestors) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        recurse(full, [...ancestors, entry.name]);
+      } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        const localIdx = ancestors.findIndex(a => LOCAL_UUID_RE.test(a));
+        if (localIdx === -1) continue;
+        // After local_<uuid> the file must be exactly at .claude/projects/<project>/<file>.jsonl
+        const after = ancestors.slice(localIdx + 1);
+        if (after.length !== 3) continue;
+        if (after[0] !== '.claude' || after[1] !== 'projects') continue;
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(full).mtimeMs; } catch {}
+        out.push({ sourceId: ancestors[localIdx], filepath: full, mtimeMs });
+      }
+    }
   }
+
+  recurse(root, []);
   return out;
-}
-
-function findMessageArray(obj) {
-  if (Array.isArray(obj)) return obj;
-  if (!obj || typeof obj !== 'object') return null;
-  for (const key of ['messages', 'conversation', 'turns', 'history', 'events']) {
-    if (Array.isArray(obj[key])) return obj[key];
-  }
-  return null;
-}
-
-function extractText(m) {
-  if (typeof m.content === 'string') return m.content;
-  if (typeof m.text === 'string') return m.text;
-  if (Array.isArray(m.content)) {
-    return m.content
-      .map(p => (typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : null)))
-      .filter(Boolean)
-      .join('\n');
-  }
-  return null;
-}
-
-function normalizeRole(role) {
-  if (!role) return null;
-  const r = String(role).toLowerCase();
-  if (r === 'user' || r === 'human') return 'user';
-  if (r === 'assistant' || r === 'agent' || r === 'cowork' || r === 'ai') return 'assistant';
-  return null;
 }
 
 module.exports = async function coworkWatcher(state, log) {
@@ -58,37 +71,22 @@ module.exports = async function coworkWatcher(state, log) {
     return deltas;
   }
 
-  const files = walk(ROOT);
-  for (const filepath of files) {
+  const found = findMainSessionJsonls(ROOT);
+
+  // One Cowork session = one source_id. If multiple main JSONLs map to the
+  // same local_<uuid>, take the most recently modified.
+  const bySourceId = new Map();
+  for (const item of found) {
+    const cur = bySourceId.get(item.sourceId);
+    if (!cur || item.mtimeMs > cur.mtimeMs) bySourceId.set(item.sourceId, item);
+  }
+
+  for (const { sourceId, filepath } of bySourceId.values()) {
     try {
-      const sourceId = path.basename(filepath, '.json');
       const existing = state.conversations[sourceId];
       if (existing && existing.active === false) continue;
 
-      const raw = fs.readFileSync(filepath, 'utf-8');
-      let parsed;
-      try { parsed = JSON.parse(raw); } catch (err) {
-        log.logError(`cowork watcher: invalid JSON in ${filepath}:`, err.message);
-        log.recordParseFailure('cowork-json-invalid', filepath, null);
-        continue;
-      }
-
-      const arr = findMessageArray(parsed);
-      if (!arr) continue;
-
-      const messages = [];
-      let firstTimestamp = parsed.started_at || parsed.created_at || null;
-      let titleCandidate = parsed.title || parsed.name || null;
-      for (const m of arr) {
-        const role = normalizeRole(m.role || m.type || m.author);
-        if (!role) continue;
-        const text = extractText(m);
-        if (!text) continue;
-        const ts = m.timestamp || m.time || m.created_at || null;
-        if (ts && !firstTimestamp) firstTimestamp = ts;
-        if (role === 'user' && !titleCandidate) titleCandidate = text.slice(0, 80).replace(/\s+/g, ' ').trim();
-        messages.push({ role, content: text, timestamp: ts || undefined });
-      }
+      const { messages, firstTimestamp, titleCandidate } = parseJsonlFile(filepath);
       if (messages.length === 0) continue;
 
       const lastIndex = existing?.last_message_index ?? 0;
@@ -98,14 +96,14 @@ module.exports = async function coworkWatcher(state, log) {
       deltas.push({
         source_id: sourceId,
         platform: 'cowork',
-        title: existing?.title || titleCandidate || `Cowork session ${sourceId.slice(0, 8)}`,
+        title: existing?.title || titleCandidate || `Cowork session ${sourceId.slice(6, 14)}`,
         started_at: existing?.started_at || firstTimestamp || new Date().toISOString(),
         from_index: lastIndex,
         new_messages: newMessages,
       });
     } catch (err) {
       log.logError(`cowork watcher: failed to parse ${filepath}:`, err.message);
-      log.recordParseFailure('cowork-json-other', filepath, null);
+      log.recordParseFailure('cowork-jsonl', filepath, null);
     }
   }
   return deltas;

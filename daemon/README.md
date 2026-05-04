@@ -23,6 +23,32 @@ the ingest endpoint — this daemon never writes there directly.
 Conversations accumulate over hours/days. There is no "session end"
 trigger — the daemon just appends new messages each pass.
 
+### Cowork session paths
+
+Cowork is essentially Claude Code running in a per-session sandbox, so
+its transcripts use the same `.jsonl` format as Claude Code CLI but
+live deep under the agent-mode-sessions tree:
+
+```
+~/Library/Application Support/Claude/local-agent-mode-sessions/
+  <workspace-uuid>/
+    <session-group-uuid>/
+      local_<uuid>/                           <-- one Cowork session
+        .claude/
+          projects/
+            <derived-project-name>/
+              <session-id>.jsonl              <-- main transcript (captured)
+              <session-id>/
+                subagents/agent-<id>.jsonl    <-- subagent (skipped)
+          sessions/, tasks/
+        outputs/, shim-perm/
+```
+
+`source_id` = the `local_<uuid>` directory name (one Cowork session = one
+archive file). The watcher captures only the main transcript at depth
+`local_<uuid>/.claude/projects/<project>/<file>.jsonl`. Subagent JSONLs
+nested deeper are intentionally skipped.
+
 ## How it works
 
 1. Read API key from macOS Keychain (`linksblue-archive-api-key`).
@@ -129,6 +155,8 @@ the second snapshot of the same content returns `no_change`.
 ```
 daemon/
 ├── daemon.js                              # entry point
+├── lib/
+│   └── jsonl-parser.js                   # shared JSONL parser (claude-code + cowork)
 ├── watchers/
 │   ├── claude-code.js                    # ~/.claude/projects/
 │   ├── cowork.js                         # local-agent-mode-sessions/
