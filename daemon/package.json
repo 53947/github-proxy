@@ -1,0 +1,17 @@
+{
+  "name": "linksblue-daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local capture daemon — snapshots Claude Code, Cowork, Claude.ai web, and Claude Desktop conversations every 15 minutes and POSTs them to the linksblue archive ingest endpoint in Mode B.",
+  "main": "daemon.js",
+  "scripts": {
+    "start": "node daemon.js",
+    "test": "./test.sh"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "classic-level": "^2.0.0"
+  }
+}
