@@ -6,9 +6,9 @@
 set -euo pipefail
 
 INGEST_URL="https://github.linksblue.network/api/archive/ingest"
-KEY="$(security find-generic-password -s linksblue-archive-api-key -w)"
+KEY="$(security find-generic-password -s LINKSBLUE_ARCHIVE_API_KEY -w)"
 if [ -z "$KEY" ]; then
-    echo "ERROR: linksblue-archive-api-key not in Keychain." >&2
+    echo "ERROR: LINKSBLUE_ARCHIVE_API_KEY not in Keychain." >&2
     exit 1
 fi
 
