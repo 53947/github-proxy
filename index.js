@@ -1020,7 +1020,8 @@ async function handleMcpPost(req, res) {
   const ts = new Date().toISOString();
   const method = Array.isArray(req.body) ? req.body.map(m => m.method).join(',') : req.body?.method;
   const sessionId = getSessionId(req);
-  console.log(`[${ts}] MCP POST method=${method} session=${sessionId || 'none'}`);
+  const isInit = isInitializeRequest(req.body);
+  console.log(`[${ts}] MCP POST method=${method} session=${sessionId || 'none'}${isInit ? ' (init)' : ''}`);
 
   try {
     // Existing session — forward request
@@ -1031,8 +1032,14 @@ async function handleMcpPost(req, res) {
       return;
     }
 
-    // New session — initialize
-    if (!sessionId && isInitializeRequest(req.body)) {
+    // Initialize — create a fresh session whether or not a (likely-stale) ID was sent.
+    // v2.9: previously this branch required `!sessionId`, which rejected init requests
+    // that included a stale session ID from a previous server lifetime. Now we accept
+    // init regardless and let the transport mint a new ID.
+    if (isInit) {
+      if (sessionId) {
+        console.log(`[${ts}] MCP → init with stale session ID ${sessionId}; minting fresh session`);
+      }
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
         eventStore,
@@ -1056,12 +1063,19 @@ async function handleMcpPost(req, res) {
       return;
     }
 
-    // Session not found
-    console.log(`[${ts}] MCP → session not found: ${sessionId}, active: [${[...sessions.keys()].join(', ')}]`);
-    res.status(400).json({
+    // Session not found AND request is not an initialize.
+    // v2.9: return 404 (was 400) with restart_hint so well-behaved MCP clients
+    // drop their cached session ID and re-initialize transparently. This is the
+    // common case after a Railway redeploy wipes the in-memory session map.
+    console.log(`[${ts}] MCP → session not found: ${sessionId}, active=[${[...sessions.keys()].join(', ')}]; returning 404 with restart hint to trigger client re-init`);
+    res.status(404).json({
       jsonrpc: '2.0',
-      error: { code: -32000, message: 'Bad request — missing or invalid session' },
-      id: null,
+      error: {
+        code: -32001,
+        message: 'Session not found — server likely restarted since this session was created. Please re-initialize.',
+        data: { restart_hint: true },
+      },
+      id: (req.body && !Array.isArray(req.body) && req.body.id !== undefined) ? req.body.id : null,
     });
   } catch (err) {
     console.error(`[${ts}] MCP POST error:`, err);
@@ -1578,7 +1592,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'linksblue-github-proxy',
-    version: '2.8',
+    version: '2.9',
     mcp: '/mcp',
     activeSessions: sessions.size,
   });
