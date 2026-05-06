@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>linksblue chrome-capture — options</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #1f2937;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Oxygen, Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px;
+    }
+    main { max-width: 640px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 18px; color: #374151; margin: 0 0 6px; }
+    .note {
+      background: #fef3c7;
+      color: #92400e;
+      padding: 10px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+      margin: 12px 0 20px;
+    }
+    h2 {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #6b7280;
+      margin: 20px 0 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      border-bottom: 1px solid #e5e7eb;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      width: 40%;
+      color: #6b7280;
+      font-weight: 600;
+    }
+    td.value {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+        "Liberation Mono", monospace;
+      font-size: 12px;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>linksblue chrome-capture &mdash; options</h1>
+    <div class="note">
+      Pass 1 (v0.1.x): no token required. Pass 2 will add token entry
+      here for posting captures to linksblue.
+    </div>
+
+    <h2>Status</h2>
+    <table>
+      <tbody>
+        <tr><th>Extension version</th><td class="value" id="ext-version">&hellip;</td></tr>
+        <tr><th>Host permissions</th><td class="value" id="ext-hosts">&hellip;</td></tr>
+        <tr><th>Captures buffered</th><td class="value" id="ext-count">&hellip;</td></tr>
+        <tr><th>Last heartbeat</th><td class="value" id="ext-heartbeat">&hellip;</td></tr>
+      </tbody>
+    </table>
+  </main>
+
+  <script src="lib/storage.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
