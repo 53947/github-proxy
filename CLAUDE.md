@@ -170,6 +170,10 @@ Four MCP tools registered alongside the read tools, and four REST endpoints unde
 
 Bearer auth via `LINKSBLUE_WRITE_KEY` is the primary security gate; the allow-list is a second independent check.
 
+### Chrome capture extension (added 2026-05-06 by Prompt 05/06/2026-29)
+
+`chrome-capture/` — Manifest V3 Chrome extension that captures `claude.ai` API responses for archival to `TRIADBLUE/ai-archive`. Pass 1 (v0.1.x) is observe-and-log only — no POST. Pass 2 will add the ingest path. See `chrome-capture/README.md`.
+
 ---
 
 ## BRAND CASING REMINDER
