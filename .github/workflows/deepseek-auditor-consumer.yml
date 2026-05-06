@@ -1,0 +1,12 @@
+name: DeepSeek PR Auditor
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  call-auditor:
+    uses: TRIADBLUE/.github/.github/workflows/deepseek-auditor-reusable.yml@main
+    secrets:
+      CROSS_REPO_PAT: ${{ secrets.CROSS_REPO_PAT }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
