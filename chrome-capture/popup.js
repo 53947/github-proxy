@@ -76,7 +76,7 @@
   function renderCount(captures) {
     var row = document.getElementById('count-row');
     var n = captures ? captures.length : 0;
-    row.textContent = n + ' capture' + (n === 1 ? '' : 's') + ' buffered (cap 200).';
+    row.textContent = n + ' capture' + (n === 1 ? '' : 's') + ' buffered (cap 50).';
   }
 
   function renderList(captures) {
@@ -146,6 +146,42 @@
       renderCount(resp.captures);
       renderList(resp.captures);
     });
+    chrome.runtime.sendMessage({ type: 'get-stats' }, function (resp) {
+      if (chrome.runtime.lastError || !resp || !resp.ok) {
+        renderStats(null);
+        return;
+      }
+      renderStats(resp);
+    });
+  }
+
+  function renderStats(stats) {
+    var banner = document.getElementById('token-banner');
+    var tokenRow = document.getElementById('stat-token');
+    var lastPost = document.getElementById('stat-lastpost');
+    var posted = document.getElementById('stat-posted');
+    var retry = document.getElementById('stat-retry');
+
+    if (!stats) {
+      if (tokenRow) tokenRow.textContent = 'unknown';
+      if (lastPost) lastPost.textContent = 'unknown';
+      if (posted) posted.textContent = '—';
+      if (retry) retry.textContent = '—';
+      if (banner) banner.hidden = true;
+      return;
+    }
+
+    if (tokenRow) {
+      tokenRow.textContent = stats.token_configured ? 'yes' : 'no';
+      tokenRow.className = stats.token_configured ? '' : 'stat-warn';
+    }
+    if (lastPost) lastPost.textContent = stats.last_post_at ? relativeTime(stats.last_post_at) : 'never';
+    if (posted) posted.textContent = String(stats.posted_total || 0);
+    if (retry) {
+      retry.textContent = String(stats.retry_queue_depth || 0) + ' / 20';
+      retry.className = (stats.retry_queue_depth || 0) > 0 ? 'stat-warn' : '';
+    }
+    if (banner) banner.hidden = !!stats.token_configured;
   }
 
   document.addEventListener('DOMContentLoaded', function () {
@@ -180,5 +216,12 @@
     document.getElementById('open-options').addEventListener('click', function () {
       try { chrome.runtime.openOptionsPage(); } catch (_) {}
     });
+
+    var banner = document.getElementById('token-banner');
+    if (banner) {
+      banner.addEventListener('click', function () {
+        try { chrome.runtime.openOptionsPage(); } catch (_) {}
+      });
+    }
   });
 })();
