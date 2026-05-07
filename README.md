@@ -18,7 +18,17 @@ Both resolve to the same Railway service on port 8080.
 - `POST /mcp` (also mounted at `/`) — Streamable HTTP MCP transport
 - `GET /mcp`, `DELETE /mcp`, `HEAD /mcp` — session management
 
-Tools exposed: `list_repos`, `get_repo`, `list_files`, `read_file`, `list_branches`, `list_issues`, `list_pulls`, `search_code`, `list_commits`.
+Tools exposed:
+
+- **Read (v2.4):** `list_repos`, `get_repo`, `list_files`, `read_file`, `list_branches`, `list_issues`, `list_pulls`, `search_code`, `list_commits`.
+- **Write — single-file (v2.5):** `write_file`, `delete_file`, `create_branch`, `move_file`.
+- **Write — multi-file & refs (v2.6):** `push_files`, `create_ref`.
+- **Pull requests (v2.6):** `create_pull_request`, `merge_pull_request`.
+- **Issues (v2.6):** `create_issue`, `update_issue`, `add_issue_comment`.
+- **Prompt-numbering ledger (v2.7):** `claim_number`, `claim_response`, `update_prompt_status`. Atomic against `TRIADBLUE/ai-archive/PROMPT_LOG.md`. Server holds `LINKSBLUE_WRITE_KEY` — callers never pass a key.
+- **Escape hatch (v2.6):** `gh_api` — generic GitHub REST passthrough.
+
+Total: 24 tools. Agent code should call these MCP tools, not the parallel REST endpoints below — REST stays for daemons and humans.
 
 ### REST — direct GitHub proxy
 
