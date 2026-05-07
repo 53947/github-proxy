@@ -26,6 +26,50 @@ const RETRY_QUEUE_CAP = 20;
 const MAX_RETRY_ATTEMPTS = 3;
 const POST_STATS_KEY = 'linksblue.post-stats';
 const ALARM_NAME = 'linksblue-snapshot-tick';
+const LAST_MESSAGE_COUNT_URL = 'https://github.linksblue.network/api/archive/last-message-count';
+
+// v0.3.0 (Prompt 05/07/2026-34, pass 3a): snapshot recovery on fresh
+// install. When chrome.storage.local has no entry for a source_id (a
+// clean reinstall just wiped storage), query the linksblue server for
+// the canonical last_message_count instead of defaulting from_index=0
+// and POSTing the entire conversation history.
+//
+// Failure-safe by design: any error path (no token, network down,
+// non-2xx, non-JSON response, malformed payload) falls back to 0 and
+// proceeds with the capture. Recovery never blocks the pipeline.
+async function recoverFromIndexFromServer(sourceId) {
+  var token = await self.linksblueStorage.getToken();
+  if (!token) {
+    try { console.warn('[linksblue-chrome-capture] recovery skipped (no token): source_id=' + sourceId); } catch (_) {}
+    return 0;
+  }
+  var url = LAST_MESSAGE_COUNT_URL + '?source_id=' + encodeURIComponent(sourceId);
+  try {
+    var res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + token } });
+    if (!res.ok) {
+      var errText = '';
+      try { errText = (await res.text()).slice(0, 200); } catch (_) {}
+      try { console.warn('[linksblue-chrome-capture] recovery failed: source_id=' + sourceId + ' status=' + res.status + ' body=' + errText); } catch (_) {}
+      return 0;
+    }
+    var data;
+    try { data = await res.json(); }
+    catch (_) {
+      try { console.warn('[linksblue-chrome-capture] recovery returned non-JSON: source_id=' + sourceId); } catch (_) {}
+      return 0;
+    }
+    var n = Number(data && data.last_message_count);
+    if (!Number.isInteger(n) || n < 0) {
+      try { console.warn('[linksblue-chrome-capture] recovery returned invalid last_message_count:', data); } catch (_) {}
+      return 0;
+    }
+    try { console.log('[linksblue-chrome-capture] recovery ok: source_id=' + sourceId + ' last_message_count=' + n + ' exists=' + !!data.exists); } catch (_) {}
+    return n;
+  } catch (err) {
+    try { console.warn('[linksblue-chrome-capture] recovery threw: source_id=' + sourceId + ' err=' + (err && err.message)); } catch (_) {}
+    return 0;
+  }
+}
 
 // v0.2.0 — flush-only scheduler. The alarm fires every 15 minutes
 // (matching the daemon cadence) and re-attempts queued retries. It
@@ -140,9 +184,29 @@ async function prepareIngestPayload(captured) {
   if (!c) return null;
 
   var lastSnapshot = await self.linksblueStorage.getLastSnapshot(c.source_id);
-  var fromIndex = (lastSnapshot && Number.isInteger(lastSnapshot.message_count))
-    ? lastSnapshot.message_count
-    : 0;
+  var fromIndex;
+  if (lastSnapshot && Number.isInteger(lastSnapshot.message_count)) {
+    fromIndex = lastSnapshot.message_count;
+  } else {
+    // v0.3.0: no local snapshot — query the linksblue server for the
+    // canonical last_message_count to avoid POSTing the entire
+    // conversation history (which would 413 against the 10mb body
+    // limit on long conversations). See Prompt 05/07/2026-34, pass-3a.
+    fromIndex = await recoverFromIndexFromServer(c.source_id);
+    // Cache the recovered value so subsequent captures of this same
+    // conversation use the fast path (no recovery query). This is the
+    // only place the recovered count enters local storage; the next
+    // successful POST overwrites this snapshot with last_message_uuid
+    // populated from the actual messages.
+    if (fromIndex > 0) {
+      await self.linksblueStorage.setLastSnapshot(c.source_id, {
+        message_count: fromIndex,
+        last_capture_at: captured.capturedAt || Date.now(),
+        last_message_uuid: null,
+        recovered: true,
+      });
+    }
+  }
 
   if (c.all_messages.length <= fromIndex) return null;
 
