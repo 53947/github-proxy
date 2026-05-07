@@ -23,6 +23,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// /api/archive/ingest receives chrome-capture POSTs of full claude.ai
+// conversations — 100s of messages, structured content, can run several
+// MB. Other routes get the default 100kb limit. (Response 05/06/2026-31c)
+// Order is load-bearing — the path-prefix override must register before
+// the global parser, since Express runs middleware in registration order
+// and the first parser to populate req.body wins.
+app.use('/api/archive/ingest', express.json({ limit: '10mb' }));
 app.use(express.json());
 
 // --- GitHub API helper ---
