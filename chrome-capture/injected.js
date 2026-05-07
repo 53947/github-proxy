@@ -41,6 +41,19 @@
     try { window.postMessage(payload, '*'); } catch (_) {}
   }
 
+  // v0.2.1 fix (Response 05/06/2026-31b): claude.ai's React app calls
+  // fetch('/api/...') with relative paths. The wrapper sees the raw
+  // input — relative — and CONV_GET_RE (anchored ^https://claude.ai/...)
+  // never matches. Resolve through new URL(raw, location.href).href so
+  // the regex sees the absolute form. new URL throws on bad input
+  // (about:blank, javascript:, malformed); we swallow the throw and
+  // return the raw string so the regex test fails for genuinely bad
+  // URLs without breaking claude.ai.
+  function safeAbsolutize(raw) {
+    try { return new URL(raw, location.href).href; }
+    catch (_) { return raw; }
+  }
+
   function urlFromRequestArg(input) {
     try {
       if (typeof input === 'string') return input;
@@ -78,7 +91,7 @@
   var origFetch = window.fetch;
   if (typeof origFetch === 'function') {
     window.fetch = function (input, init) {
-      var url = urlFromRequestArg(input);
+      var url = safeAbsolutize(urlFromRequestArg(input));
       var method = methodFromInit(input, init);
       var p = origFetch.apply(this, arguments);
       try {
@@ -106,7 +119,7 @@
     var origSend = XHRProto.send;
     XHRProto.open = function (method, url) {
       try {
-        this.__linksblueUrl = String(url);
+        this.__linksblueUrl = safeAbsolutize(String(url));
         this.__linksblueMethod = method ? String(method).toUpperCase() : 'GET';
       } catch (_) {}
       return origOpen.apply(this, arguments);
