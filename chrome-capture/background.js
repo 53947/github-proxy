@@ -20,6 +20,97 @@
 importScripts('lib/storage.js', 'lib/log-buffer.js', 'lib/transformer.js');
 
 const HEARTBEAT_KEY = 'linksblue.lastHeartbeat';
+const INGEST_URL = 'https://github.linksblue.network/api/archive/ingest';
+const RETRY_QUEUE_KEY = 'linksblue.retry-queue';
+const RETRY_QUEUE_CAP = 20;
+const MAX_RETRY_ATTEMPTS = 3;
+const POST_STATS_KEY = 'linksblue.post-stats';
+
+// v0.2.0: POST a Mode B payload to the ingest endpoint with bearer
+// auth. Throws on non-2xx (caller decides to enqueue or drop).
+async function postToIngest(payload, token) {
+  var response = await fetch(INGEST_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    var errorText = '';
+    try { errorText = await response.text(); } catch (_) {}
+    var err = new Error('ingest POST failed: ' + response.status + ' ' + errorText.slice(0, 200));
+    err.status = response.status;
+    throw err;
+  }
+  return response.json();
+}
+
+async function getRetryQueue() {
+  var q = await self.linksblueStorage.get(RETRY_QUEUE_KEY);
+  return Array.isArray(q) ? q : [];
+}
+
+async function enqueueRetry(payload, error) {
+  var q = await getRetryQueue();
+  q.push({
+    payload: payload,
+    attempts: 1,
+    queued_at: Date.now(),
+    last_error: (error && error.message) ? String(error.message).slice(0, 200) : 'unknown',
+  });
+  // Cap: drop oldest entries when over.
+  while (q.length > RETRY_QUEUE_CAP) q.shift();
+  await self.linksblueStorage.set(RETRY_QUEUE_KEY, q);
+}
+
+async function flushRetryQueue() {
+  var token = await self.linksblueStorage.getToken();
+  if (!token) return { attempted: 0, sent: 0, requeued: 0, dropped: 0 };
+  var q = await getRetryQueue();
+  if (q.length === 0) return { attempted: 0, sent: 0, requeued: 0, dropped: 0 };
+
+  var remaining = [];
+  var sent = 0, dropped = 0;
+  for (var i = 0; i < q.length; i++) {
+    var item = q[i];
+    try {
+      await postToIngest(item.payload, token);
+      sent += 1;
+      await bumpPostStats();
+      // Snapshot wasn't carried with the queued payload (we only kept
+      // the wire-shape body), so we don't update lastSnapshot here.
+      // The next live capture's getLastSnapshot will reflect whatever
+      // is currently stored; the server's Mode B handler tolerates
+      // from_index < message_count by slicing the overlap. One-time
+      // duplicate range across a recovered retry is acceptable.
+    } catch (err) {
+      var attempts = (item.attempts || 0) + 1;
+      var nextItem = {
+        payload: item.payload,
+        attempts: attempts,
+        queued_at: item.queued_at,
+        last_error: (err && err.message) ? String(err.message).slice(0, 200) : 'unknown',
+      };
+      if (attempts < MAX_RETRY_ATTEMPTS) {
+        remaining.push(nextItem);
+      } else {
+        dropped += 1;
+        try { console.warn('[linksblue-chrome-capture] dropping payload after ' + attempts + ' attempts: ' + (nextItem.last_error || '')); } catch (_) {}
+      }
+    }
+  }
+  await self.linksblueStorage.set(RETRY_QUEUE_KEY, remaining);
+  return { attempted: q.length, sent: sent, requeued: remaining.length, dropped: dropped };
+}
+
+async function bumpPostStats() {
+  var cur = (await self.linksblueStorage.get(POST_STATS_KEY)) || {};
+  cur.posted_total = (Number(cur.posted_total) || 0) + 1;
+  cur.last_post_at = Date.now();
+  await self.linksblueStorage.set(POST_STATS_KEY, cur);
+}
 
 // v0.2.0: prepare an ingest payload from a captured chat_conversations
 // response. Returns:
@@ -100,16 +191,26 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           idHash: idHash,
         });
 
-        // v0.2.0: compute would-be ingest payload via dedupe path. The
-        // POST + snapshot-update steps are wired in commit 5 (POST to
-        // ingest + retry queue). For now, prepare and report status —
-        // no network egress in this commit yet.
+        // v0.2.0: compute ingest payload via dedupe path, then POST.
         var prepared = await prepareIngestPayload(p);
         if (!prepared) {
           sendResponse({ ok: true, status: 'nothing-new' });
           return;
         }
-        sendResponse({ ok: true, status: 'prepared', count: prepared.payload.new_messages.length });
+        var token = await self.linksblueStorage.getToken();
+        if (!token) {
+          sendResponse({ ok: true, status: 'no-token', count: prepared.payload.new_messages.length });
+          return;
+        }
+        try {
+          await postToIngest(prepared.payload, token);
+          await self.linksblueStorage.setLastSnapshot(prepared.payload.source_id, prepared.snapshot);
+          await bumpPostStats();
+          sendResponse({ ok: true, status: 'posted', count: prepared.payload.new_messages.length });
+        } catch (postErr) {
+          await enqueueRetry(prepared.payload, postErr);
+          sendResponse({ ok: true, status: 'queued', count: prepared.payload.new_messages.length, error: postErr && postErr.message });
+        }
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message });
       }
@@ -150,6 +251,26 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
         var arr = await self.linksblueLogBuffer.getCaptures();
         var hb = await self.linksblueStorage.get(HEARTBEAT_KEY);
         sendResponse({ ok: true, captures: arr, heartbeat: hb || null });
+      } catch (err) {
+        sendResponse({ ok: false, error: err && err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'get-stats') {
+    (async function () {
+      try {
+        var stats = (await self.linksblueStorage.get(POST_STATS_KEY)) || {};
+        var queue = await getRetryQueue();
+        var token = await self.linksblueStorage.getToken();
+        sendResponse({
+          ok: true,
+          token_configured: !!token,
+          posted_total: Number(stats.posted_total) || 0,
+          last_post_at: stats.last_post_at || null,
+          retry_queue_depth: queue.length,
+        });
       } catch (err) {
         sendResponse({ ok: false, error: err && err.message });
       }

@@ -39,4 +39,19 @@
   self.linksblueStorage.setLastSnapshot = function (sourceId, snapshot) {
     return self.linksblueStorage.set('linksblue.snapshot.' + sourceId, snapshot);
   };
+
+  // v0.2.0 helpers — bearer token storage (Prompt 05/06/2026-31).
+  // The token is stored ONLY in chrome.storage.local under the single
+  // key "linksblue.token". Never logged, never sent in postMessage,
+  // never written to the popup display in plain text. The options page
+  // shows only the first 8 chars + "..." for verification.
+  self.linksblueStorage.getToken = function () {
+    return self.linksblueStorage.get('linksblue.token');
+  };
+  self.linksblueStorage.setToken = function (token) {
+    return self.linksblueStorage.set('linksblue.token', token);
+  };
+  self.linksblueStorage.clearToken = function () {
+    return self.linksblueStorage.remove('linksblue.token');
+  };
 })();
