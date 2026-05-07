@@ -42,9 +42,13 @@
 
   // v0.2.0 helpers — bearer token storage (Prompt 05/06/2026-31).
   // The token is stored ONLY in chrome.storage.local under the single
-  // key "linksblue.token". Never logged, never sent in postMessage,
-  // never written to the popup display in plain text. The options page
-  // shows only the first 8 chars + "..." for verification.
+  // key "linksblue.token".
+  // Security invariants (verified by gates 4 + 5):
+  //   - Never written to any console output.
+  //   - Never relayed via window.postMessage or chrome.runtime.sendMessage.
+  //   - Never written to the popup display in plain text.
+  // The options page shows only the first 8 chars + "..." for
+  // verification.
   self.linksblueStorage.getToken = function () {
     return self.linksblueStorage.get('linksblue.token');
   };
