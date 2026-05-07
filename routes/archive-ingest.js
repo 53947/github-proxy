@@ -19,25 +19,22 @@
 const express = require('express');
 const router = express.Router();
 
-const GITHUB_API = 'https://api.github.com';
-const ARCHIVE_OWNER = 'TRIADBLUE';
-const ARCHIVE_REPO  = 'ai-archive';
+const {
+  GITHUB_API,
+  ARCHIVE_OWNER,
+  ARCHIVE_REPO,
+  ghHeaders,
+  ghGetFile,
+  ghSearchSourceId,
+  parseFrontmatter,
+  requireBearer,
+} = require('./archive-helpers');
+
 const VALID_PLATFORMS = ['claude_code', 'claude_web', 'claude_desktop', 'cowork'];
 
 // ---------------------------------------------------------------------------
-// GitHub helpers
+// GitHub write helper (ingest-only — read helpers live in archive-helpers.js)
 // ---------------------------------------------------------------------------
-
-function ghHeaders() {
-  const h = {
-    'Accept': 'application/vnd.github+json',
-    'User-Agent': 'linksblue-archive-ingest/1.0',
-  };
-  if (process.env.GITHUB_TOKEN) {
-    h['Authorization'] = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-  return h;
-}
 
 async function ghPut(path, body) {
   const res = await fetch(`${GITHUB_API}${path}`, {
@@ -53,37 +50,6 @@ async function ghPut(path, body) {
     throw err;
   }
   return res.json();
-}
-
-async function ghGetFile(path) {
-  const res = await fetch(`${GITHUB_API}${path}`, { headers: ghHeaders() });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GitHub GET ${path} ${res.status}: ${text}`);
-  }
-  const data = await res.json();
-  const content = Buffer.from(data.content, 'base64').toString('utf-8');
-  return { content, sha: data.sha };
-}
-
-async function ghSearchSourceId(sourceId) {
-  // GitHub code search across the private archive repo. Index can lag a few
-  // seconds — Mode A has a 422 fallback (path-existence + frontmatter
-  // source_id compare) for that race. Mode B reads the existing file via
-  // Contents API directly, which is immediately consistent.
-  const q = `"source_id: ${sourceId}" repo:${ARCHIVE_OWNER}/${ARCHIVE_REPO}`;
-  const url = `${GITHUB_API}/search/code?q=${encodeURIComponent(q)}`;
-  const res = await fetch(url, { headers: ghHeaders() });
-  if (!res.ok) {
-    console.warn(`[archive-ingest] dedupe search ${res.status}: ${await res.text()}`);
-    return null;
-  }
-  const data = await res.json();
-  if (Array.isArray(data.items) && data.items.length > 0) {
-    return data.items[0].path;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,55 +110,14 @@ function frontmatterSourceId(markdown) {
   return m ? m[1].trim() : null;
 }
 
-// Parse the YAML frontmatter at the top of a markdown file. Returns
-// { fm: <key/value object>, fmEndIdx: <line index of closing ---> } or null
-// if the file has no '---' delimiter pair at the top.
-//
-// Deliberately limited to the format buildFrontmatter() produces: simple
-// `key: value` lines, optional double-quoted string scalars. No YAML library.
-function parseFrontmatter(markdown) {
-  const lines = markdown.split('\n');
-  if (lines[0] !== '---') return null;
-  let endIdx = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') { endIdx = i; break; }
-  }
-  if (endIdx === -1) return null;
-  const fm = {};
-  for (let i = 1; i < endIdx; i++) {
-    const line = lines[i];
-    const m = line.match(/^([a-z_]+):\s*(.*)$/);
-    if (!m) continue;
-    let v = m[2].trim();
-    if (v.startsWith('"') && v.endsWith('"')) {
-      v = v.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    }
-    fm[m[1]] = v;
-  }
-  return { fm, fmEndIdx: endIdx };
-}
-
 // Extract the body content (everything after the closing '---' of the
 // frontmatter). Returns the full markdown if no frontmatter is present.
+// parseFrontmatter() lives in ./archive-helpers.
 function parseExistingBody(markdown) {
   const parsed = parseFrontmatter(markdown);
   if (!parsed) return markdown;
   const lines = markdown.split('\n');
   return lines.slice(parsed.fmEndIdx + 1).join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Auth middleware
-// ---------------------------------------------------------------------------
-
-// SINGLE-USER AUTH — multi-user plug point goes here
-function requireBearer(req, res, next) {
-  const expected = process.env.ARCHIVE_API_KEY;
-  const got = req.headers.authorization || '';
-  if (!expected || got !== `Bearer ${expected}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
 }
 
 // ---------------------------------------------------------------------------
