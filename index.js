@@ -1716,6 +1716,7 @@ app.patch('/api/archive/prompt-status', requireWriteKey, async (req, res) => {
 });
 
 app.use('/api/archive', require('./routes/archive-ingest'));
+app.use('/api/archive', require('./routes/archive-last-message-count'));
 
 // --- GET / without session header = health check ---
 app.get('/', (req, res) => {
