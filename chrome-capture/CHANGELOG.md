@@ -1,5 +1,9 @@
 # linksblue chrome-capture — Changelog
 
+## 0.2.1 — 2026-05-07
+- Fix: resolve relative URLs to absolute via `new URL(raw, location.href).href` before regex match (Response 05/06/2026-31b). Pass-2's `CONV_GET_RE` is anchored on `^https://claude.ai/...`, but claude.ai's React app calls `fetch('/api/...')` with relative paths — every match returned false and no captures landed. Applies to both fetch and XHR branches.
+- Cosmetic: popup subtitle updated 0.2.0 → 0.2.1 to match manifest version (the hardcoded subtitle in pass 2 caused 0.2.0/0.2.99 install-version confusion during the 31b investigation).
+
 ## 0.2.0 — 2026-05-06
 - Narrowed URL filter to chat_conversations GET only (Prompt 05/06/2026-31).
 - Added transformer (parsedJson → ingest contract shape).
