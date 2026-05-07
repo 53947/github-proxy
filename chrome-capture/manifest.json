@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "linksblue chrome-capture",
-  "version": "0.2.0",
-  "description": "Captures claude.ai conversation snapshots to TRIADBLUE/ai-archive via linksblue. v0.2.x: posts captures to ingest endpoint.",
+  "name": "linksblue chrome-capture (DIAG)",
+  "version": "0.2.99",
+  "description": "DIAGNOSTIC BUILD — extra logging only. Not for merge. Response 05/06/2026-31b investigates why captures buffered stays at 0 in v0.2.0.",
   "permissions": ["storage", "activeTab", "alarms"],
   "host_permissions": [
     "https://claude.ai/*",

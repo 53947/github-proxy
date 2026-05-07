@@ -1,44 +1,45 @@
 // injected.js — page-world fetch and XMLHttpRequest wrapper.
 //
-// Loaded by content-script.js into the page's JS context (NOT the
-// extension's isolated world) so it can wrap window.fetch and
-// XMLHttpRequest.prototype.send and observe the responses the page
-// itself receives from its own API.
+// !!! DIAGNOSTIC BUILD — Response 05/06/2026-31b !!!
 //
-// v0.2.0 narrows the filter: only the chat_conversations GET is
-// captured. That endpoint returns the full conversation tree post-stream
-// (~137KB JSON) and is sufficient by itself — capturing the SSE
-// completion endpoint is intentionally out of scope. See Prompt
-// 05/06/2026-29's verified note for the diagnostic that confirmed
-// this is the correct surface.
+// This file has been temporarily augmented with [linksblue-diag] console
+// logs at every step of the capture path so we can see exactly where
+// captures are dropping in v0.2.0. The logging is verbose by design —
+// the goal is to surface enough signal that one console copy/paste tells
+// us which of the four hypotheses is correct.
 //
-// Responsibilities:
-//   - Wrap fetch and XHR exactly once. Idempotent; no-op on repeat.
-//   - Filter to GET requests against the chat_conversations endpoint
-//     ONLY (CONV_GET_RE shared between fetch and XHR branches).
-//   - Clone responses before reading. The page must still see the
-//     original body — never consume it.
-//   - Skip silently if the parsed body lacks a top-level `uuid` field
-//     (a guard against shape drift). Log the skip once per page-load.
-//   - Forward parsed JSON to the content script via window.postMessage
-//     with source "linksblue-chrome-capture".
-//   - Never mutate request or response. Never block. Errors swallowed —
-//     capture failure must never break claude.ai.
+// What we log (and never log):
+//   - URL, method, status, response text length, top-level keys of the
+//     parsed body, presence/absence of the `uuid` field. STRUCTURAL
+//     metadata only.
+//   - We do NOT log the bearer token (it doesn't exist in this file
+//     anyway — the token only enters background.js).
+//   - We do NOT log full conversation contents — no `chat_messages`,
+//     no message bodies. Only the top-level key list.
+//
+// All [linksblue-diag] logs are removed in v0.2.1 (step 2). This file
+// reverts to the v0.2.0 behavior with the actual fix applied.
 
 (function () {
   if (window.__linksblueChromeCaptureInstalled) return;
   window.__linksblueChromeCaptureInstalled = true;
 
-  // The single capture target — exactly the chat_conversations GET that
-  // claude.ai's React app fires after each turn finishes streaming.
-  // Anchored: 36-char UUIDs in both org and conversation positions, with
-  // either a query string or end-of-URL after the conversation UUID.
   var CONV_GET_RE = /^https:\/\/claude\.ai\/api\/organizations\/[0-9a-f-]{36}\/chat_conversations\/[0-9a-f-]{36}(\?|$)/;
 
   var missingUuidLogged = false;
+  var keysLogged = false;
+
+  function dlog() {
+    try { console.log.apply(console, arguments); } catch (_) {}
+  }
 
   function safePostMessage(payload) {
-    try { window.postMessage(payload, '*'); } catch (_) {}
+    try {
+      window.postMessage(payload, '*');
+      dlog('[linksblue-diag] fetch postMessage OK');
+    } catch (err) {
+      dlog('[linksblue-diag] fetch postMessage threw:', err && err.message ? err.message : String(err));
+    }
   }
 
   function urlFromRequestArg(input) {
@@ -58,13 +59,31 @@
   }
 
   function maybeForward(url, status, parsed, capturedAt) {
-    if (!parsed || typeof parsed.uuid !== 'string') {
+    var topKeys = '';
+    try {
+      topKeys = parsed && typeof parsed === 'object' ? Object.keys(parsed).join(',') : '(not-object)';
+    } catch (_) { topKeys = '(keys-threw)'; }
+
+    if (!keysLogged) {
+      keysLogged = true;
+      dlog('[linksblue-diag] response top-level keys (first match this page-load):', topKeys);
+    } else {
+      dlog('[linksblue-diag] response top-level keys (subsequent):', topKeys);
+    }
+
+    var hasUuidStr = parsed && typeof parsed.uuid === 'string';
+    dlog('[linksblue-diag] parsed.uuid is string?', hasUuidStr,
+         '(typeof parsed.uuid =', typeof (parsed && parsed.uuid) + ')');
+
+    if (!hasUuidStr) {
       if (!missingUuidLogged) {
         missingUuidLogged = true;
         try { console.log('[linksblue-chrome-capture] response missing uuid; skipped'); } catch (_) {}
       }
+      dlog('[linksblue-diag] DROPPING (uuid guard) — url=', url);
       return;
     }
+    dlog('[linksblue-diag] forwarding to content script — url=', url, 'status=', status);
     safePostMessage({
       source: 'linksblue-chrome-capture',
       url: url,
@@ -80,23 +99,59 @@
     window.fetch = function (input, init) {
       var url = urlFromRequestArg(input);
       var method = methodFromInit(input, init);
+
+      // Log every API-shaped fetch (filters out static asset noise but
+      // catches near-matches that might tell us the regex is wrong).
+      if (url && url.indexOf('/api/') !== -1) {
+        dlog('[linksblue-diag] fetch entered (api): method=', method, 'url=', url,
+             'matches CONV_GET_RE?', CONV_GET_RE.test(url));
+      }
+
       var p = origFetch.apply(this, arguments);
       try {
         if (method === 'GET' && CONV_GET_RE.test(url)) {
+          dlog('[linksblue-diag] fetch matched URL — awaiting response');
           p.then(function (response) {
             try {
-              var clone = response.clone();
+              dlog('[linksblue-diag] fetch response arrived: status=', response.status,
+                   'content-type=', response.headers.get('content-type'));
+              var clone;
+              try { clone = response.clone(); } catch (cloneErr) {
+                dlog('[linksblue-diag] fetch response.clone() threw:', cloneErr && cloneErr.message);
+                return;
+              }
               clone.text().then(function (text) {
+                var len = text == null ? 0 : text.length;
+                dlog('[linksblue-diag] fetch text length=', len);
+                if (len === 0) {
+                  dlog('[linksblue-diag] fetch text empty — body may have been pre-consumed by page or stream');
+                  return;
+                }
                 var parsed;
-                try { parsed = JSON.parse(text); } catch (_) { return; }
+                try { parsed = JSON.parse(text); }
+                catch (parseErr) {
+                  dlog('[linksblue-diag] fetch JSON.parse failed:', parseErr && parseErr.message,
+                       'text starts with:', text.slice(0, 100));
+                  return;
+                }
+                dlog('[linksblue-diag] fetch JSON.parse OK');
                 maybeForward(url, response.status, parsed, Date.now());
-              }).catch(function () {});
-            } catch (_) {}
-          }).catch(function () {});
+              }).catch(function (textErr) {
+                dlog('[linksblue-diag] fetch clone.text() rejected:', textErr && textErr.message);
+              });
+            } catch (innerErr) {
+              dlog('[linksblue-diag] fetch response handler threw:', innerErr && innerErr.message);
+            }
+          }).catch(function (fetchErr) {
+            dlog('[linksblue-diag] fetch promise rejected:', fetchErr && fetchErr.message);
+          });
         }
-      } catch (_) {}
+      } catch (outerErr) {
+        dlog('[linksblue-diag] fetch wrapper outer threw:', outerErr && outerErr.message);
+      }
       return p;
     };
+    dlog('[linksblue-diag] fetch wrapper installed');
   }
 
   // ---- XHR wrapper ----
@@ -118,20 +173,40 @@
           try {
             var url = xhr.__linksblueUrl || '';
             var method = xhr.__linksblueMethod || 'GET';
+            if (url && url.indexOf('/api/') !== -1) {
+              dlog('[linksblue-diag] xhr load (api): method=', method, 'url=', url,
+                   'matches CONV_GET_RE?', CONV_GET_RE.test(url));
+            }
             if (method !== 'GET') return;
             if (!CONV_GET_RE.test(url)) return;
+            dlog('[linksblue-diag] xhr matched URL — reading response');
             var text = '';
             try {
               text = (xhr.responseType === '' || xhr.responseType === 'text') ? xhr.responseText : '';
-            } catch (_) {}
+            } catch (rtErr) {
+              dlog('[linksblue-diag] xhr responseText read threw:', rtErr && rtErr.message);
+            }
+            dlog('[linksblue-diag] xhr text length=', text ? text.length : 0,
+                 'responseType=', xhr.responseType);
             if (!text) return;
             var parsed;
-            try { parsed = JSON.parse(text); } catch (_) { return; }
+            try { parsed = JSON.parse(text); }
+            catch (parseErr) {
+              dlog('[linksblue-diag] xhr JSON.parse failed:', parseErr && parseErr.message,
+                   'text starts with:', text.slice(0, 100));
+              return;
+            }
+            dlog('[linksblue-diag] xhr JSON.parse OK');
             maybeForward(url, xhr.status, parsed, Date.now());
-          } catch (_) {}
+          } catch (loadErr) {
+            dlog('[linksblue-diag] xhr load handler threw:', loadErr && loadErr.message);
+          }
         });
       } catch (_) {}
       return origSend.apply(this, arguments);
     };
+    dlog('[linksblue-diag] xhr wrapper installed');
   }
+
+  dlog('[linksblue-diag] injected.js init complete; CONV_GET_RE=', CONV_GET_RE.toString());
 })();

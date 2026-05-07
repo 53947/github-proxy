@@ -1,5 +1,12 @@
 // background.js — extension service worker.
 //
+// !!! DIAGNOSTIC BUILD — Response 05/06/2026-31b !!!
+// [linksblue-diag] logs added at every step of the captured-message
+// handling pipeline so we can read in the SW DevTools console exactly
+// where captures drop. No token logging. No conversation contents
+// logged — only structural metadata (url, message counts, source_id,
+// HTTP status). Diagnostic removed in v0.2.1.
+//
 // Message-driven only. No network egress in pass 1: no fetch, no POST,
 // no anything outside this browser. Pass 2 will add the ingest POST
 // path; until then this file is read-only with respect to the network.
@@ -18,6 +25,10 @@
 //   type: 'get-log'   — return the buffer + last heartbeat (popup load).
 
 importScripts('lib/storage.js', 'lib/log-buffer.js', 'lib/transformer.js');
+
+function dlog() {
+  try { console.log.apply(console, arguments); } catch (_) {}
+}
 
 const HEARTBEAT_KEY = 'linksblue.lastHeartbeat';
 const INGEST_URL = 'https://github.linksblue.network/api/archive/ingest';
@@ -44,6 +55,9 @@ function ensureAlarm() {
 // v0.2.0: POST a Mode B payload to the ingest endpoint with bearer
 // auth. Throws on non-2xx (caller decides to enqueue or drop).
 async function postToIngest(payload, token) {
+  dlog('[linksblue-diag] worker postToIngest: source_id=', payload.source_id,
+       'from_index=', payload.from_index,
+       'new_messages.length=', payload.new_messages ? payload.new_messages.length : 0);
   var response = await fetch(INGEST_URL, {
     method: 'POST',
     headers: {
@@ -52,9 +66,12 @@ async function postToIngest(payload, token) {
     },
     body: JSON.stringify(payload),
   });
+  dlog('[linksblue-diag] worker postToIngest response: status=', response.status,
+       'ok=', response.ok);
   if (!response.ok) {
     var errorText = '';
     try { errorText = await response.text(); } catch (_) {}
+    dlog('[linksblue-diag] worker postToIngest non-2xx body preview:', errorText.slice(0, 200));
     var err = new Error('ingest POST failed: ' + response.status + ' ' + errorText.slice(0, 200));
     err.status = response.status;
     throw err;
@@ -135,16 +152,34 @@ async function bumpPostStats() {
 //     in routes/archive-ingest.js; snapshot is what to store after the
 //     POST succeeds (commit 5 wires that step in).
 async function prepareIngestPayload(captured) {
-  if (!captured || !captured.parsedJson) return null;
+  if (!captured || !captured.parsedJson) {
+    dlog('[linksblue-diag] prepareIngestPayload: no captured.parsedJson');
+    return null;
+  }
   var c = self.linksblueTransformer.transformConversation(captured.parsedJson);
-  if (!c) return null;
+  if (!c) {
+    dlog('[linksblue-diag] prepareIngestPayload: transformer returned null',
+         '(parsedJson.uuid not a string? top keys=',
+         (captured.parsedJson && typeof captured.parsedJson === 'object')
+           ? Object.keys(captured.parsedJson).join(',') : '(non-object)', ')');
+    return null;
+  }
+  dlog('[linksblue-diag] prepareIngestPayload: transformer ok',
+       'source_id=', c.source_id, 'all_messages.length=', c.all_messages.length);
 
   var lastSnapshot = await self.linksblueStorage.getLastSnapshot(c.source_id);
   var fromIndex = (lastSnapshot && Number.isInteger(lastSnapshot.message_count))
     ? lastSnapshot.message_count
     : 0;
+  dlog('[linksblue-diag] prepareIngestPayload: lastSnapshot.message_count=',
+       lastSnapshot ? lastSnapshot.message_count : '(none)',
+       'fromIndex=', fromIndex,
+       'totalMessages=', c.all_messages.length);
 
-  if (c.all_messages.length <= fromIndex) return null;
+  if (c.all_messages.length <= fromIndex) {
+    dlog('[linksblue-diag] prepareIngestPayload: nothing-new (totalMessages <= fromIndex)');
+    return null;
+  }
 
   var newMessages = c.all_messages.slice(fromIndex);
   var lastMsg = c.all_messages[c.all_messages.length - 1];
@@ -216,6 +251,9 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     (async function () {
       try {
         var p = message.payload || {};
+        dlog('[linksblue-diag] worker received captured message: url=', p.url,
+             'hasParsed=', !!p.parsedJson,
+             'parsed.uuid type=', typeof (p.parsedJson && p.parsedJson.uuid));
         var idHash = await sha256Truncate12(String(p.url || '') + ':' + String(p.capturedAt || ''));
         await self.linksblueLogBuffer.appendCapture({
           url: p.url,
@@ -224,28 +262,42 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           capturedAt: p.capturedAt,
           idHash: idHash,
         });
+        dlog('[linksblue-diag] worker appended to debug buffer; idHash=', idHash);
 
-        // v0.2.0: compute ingest payload via dedupe path, then POST.
+        dlog('[linksblue-diag] worker invoking transformer.transformConversation');
         var prepared = await prepareIngestPayload(p);
         if (!prepared) {
+          dlog('[linksblue-diag] worker prepareIngestPayload returned null',
+               '(transformer rejected uuid OR nothing-new vs lastSnapshot)');
           sendResponse({ ok: true, status: 'nothing-new' });
           return;
         }
+        dlog('[linksblue-diag] worker prepared payload:',
+             'source_id=', prepared.payload.source_id,
+             'from_index=', prepared.payload.from_index,
+             'new_messages.length=', prepared.payload.new_messages.length,
+             'snapshot.message_count=', prepared.snapshot.message_count);
         var token = await self.linksblueStorage.getToken();
         if (!token) {
+          dlog('[linksblue-diag] worker no token configured; skipping POST');
           sendResponse({ ok: true, status: 'no-token', count: prepared.payload.new_messages.length });
           return;
         }
+        dlog('[linksblue-diag] worker token present; attempting POST');
         try {
           await postToIngest(prepared.payload, token);
           await self.linksblueStorage.setLastSnapshot(prepared.payload.source_id, prepared.snapshot);
           await bumpPostStats();
+          dlog('[linksblue-diag] worker POST OK; snapshot stored');
           sendResponse({ ok: true, status: 'posted', count: prepared.payload.new_messages.length });
         } catch (postErr) {
+          dlog('[linksblue-diag] worker POST failed; enqueuing for retry:',
+               postErr && postErr.message);
           await enqueueRetry(prepared.payload, postErr);
           sendResponse({ ok: true, status: 'queued', count: prepared.payload.new_messages.length, error: postErr && postErr.message });
         }
       } catch (err) {
+        dlog('[linksblue-diag] worker captured-handler threw:', err && err.message);
         sendResponse({ ok: false, error: err && err.message });
       }
     })();
