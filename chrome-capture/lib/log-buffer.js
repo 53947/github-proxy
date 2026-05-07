@@ -5,7 +5,10 @@
 
 (function () {
   var KEY = 'linksblue.captures';
-  var CAP = 200;
+  // v0.2.0: cap reduced from 200 → 50. The buffer is now debug-only;
+  // posted captures live in ai-archive. 50 entries is enough to verify
+  // the wrapper is firing without bloating chrome.storage.local.
+  var CAP = 50;
 
   async function getCaptures() {
     var v = await self.linksblueStorage.get(KEY);

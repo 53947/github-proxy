@@ -74,6 +74,40 @@ html, body {
   color: var(--muted);
 }
 
+.token-banner {
+  margin-top: 8px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  padding: 6px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.token-banner:hover { filter: brightness(0.97); }
+
+.post-stats {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  font-size: 11px;
+}
+
+.post-stats dt { color: var(--muted); margin: 0; }
+.post-stats dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--fg);
+}
+
+.post-stats .stat-warn { color: var(--warn-fg); font-weight: 600; }
+
 .actions {
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);

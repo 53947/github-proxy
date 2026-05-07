@@ -1,10 +1,13 @@
 {
   "manifest_version": 3,
   "name": "linksblue chrome-capture",
-  "version": "0.1.0",
-  "description": "Captures claude.ai conversation API responses for archival to TRIADBLUE/ai-archive via linksblue. Pass 1: intercept and log only — no POST.",
-  "permissions": ["storage", "activeTab"],
-  "host_permissions": ["https://claude.ai/*"],
+  "version": "0.2.0",
+  "description": "Captures claude.ai conversation snapshots to TRIADBLUE/ai-archive via linksblue. v0.2.x: posts captures to ingest endpoint.",
+  "permissions": ["storage", "activeTab", "alarms"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://github.linksblue.network/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

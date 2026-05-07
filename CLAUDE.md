@@ -172,7 +172,7 @@ Bearer auth via `LINKSBLUE_WRITE_KEY` is the primary security gate; the allow-li
 
 ### Chrome capture extension (added 2026-05-06 by Prompt 05/06/2026-29)
 
-`chrome-capture/` — Manifest V3 Chrome extension that captures `claude.ai` API responses for archival to `TRIADBLUE/ai-archive`. Pass 1 (v0.1.x) is observe-and-log only — no POST. Pass 2 will add the ingest path. See `chrome-capture/README.md`.
+`chrome-capture/` — Manifest V3 Chrome extension. v0.2.x captures the chat_conversations GET endpoint and posts snapshots to `/api/archive/ingest`. Peer to `linksblue/daemon/`. See `chrome-capture/README.md`.
 
 ---
 

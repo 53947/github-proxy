@@ -8,12 +8,21 @@
 <body>
   <header class="header">
     <h1>linksblue chrome-capture</h1>
-    <p class="subtitle">Pass 1 — observe and log only</p>
+    <p class="subtitle">v0.2.0 &mdash; capturing chat_conversations</p>
   </header>
 
   <section class="status">
     <div id="status-row" class="status-row">checking&hellip;</div>
-    <div id="count-row" class="count-row">0 captures buffered (cap 200)</div>
+    <div id="token-banner" class="token-banner" hidden>
+      Configure token in Options to enable archiving.
+    </div>
+    <div id="count-row" class="count-row">0 captures buffered (cap 50)</div>
+    <dl class="post-stats">
+      <dt>Token configured</dt> <dd id="stat-token">&hellip;</dd>
+      <dt>Last successful POST</dt> <dd id="stat-lastpost">&hellip;</dd>
+      <dt>Captures posted (total)</dt> <dd id="stat-posted">&hellip;</dd>
+      <dt>Pending retry</dt> <dd id="stat-retry">&hellip;</dd>
+    </dl>
   </section>
 
   <section class="actions">

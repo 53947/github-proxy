@@ -27,4 +27,35 @@
       });
     },
   };
+
+  // v0.2.0 helpers — last-snapshot tracking for client-side dedupe
+  // (Prompt 05/06/2026-31). One snapshot per source_id under the key
+  // "linksblue.snapshot.<source_id>". Stored shape:
+  //   { message_count, last_capture_at, last_message_uuid }
+  // Only metadata — never the full conversation JSON.
+  self.linksblueStorage.getLastSnapshot = function (sourceId) {
+    return self.linksblueStorage.get('linksblue.snapshot.' + sourceId);
+  };
+  self.linksblueStorage.setLastSnapshot = function (sourceId, snapshot) {
+    return self.linksblueStorage.set('linksblue.snapshot.' + sourceId, snapshot);
+  };
+
+  // v0.2.0 helpers — bearer token storage (Prompt 05/06/2026-31).
+  // The token is stored ONLY in chrome.storage.local under the single
+  // key "linksblue.token".
+  // Security invariants (verified by gates 4 + 5):
+  //   - Never written to any console output.
+  //   - Never relayed via window.postMessage or chrome.runtime.sendMessage.
+  //   - Never written to the popup display in plain text.
+  // The options page shows only the first 8 chars + "..." for
+  // verification.
+  self.linksblueStorage.getToken = function () {
+    return self.linksblueStorage.get('linksblue.token');
+  };
+  self.linksblueStorage.setToken = function (token) {
+    return self.linksblueStorage.set('linksblue.token', token);
+  };
+  self.linksblueStorage.clearToken = function () {
+    return self.linksblueStorage.remove('linksblue.token');
+  };
 })();
