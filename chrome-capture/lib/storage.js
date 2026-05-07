@@ -27,4 +27,16 @@
       });
     },
   };
+
+  // v0.2.0 helpers — last-snapshot tracking for client-side dedupe
+  // (Prompt 05/06/2026-31). One snapshot per source_id under the key
+  // "linksblue.snapshot.<source_id>". Stored shape:
+  //   { message_count, last_capture_at, last_message_uuid }
+  // Only metadata — never the full conversation JSON.
+  self.linksblueStorage.getLastSnapshot = function (sourceId) {
+    return self.linksblueStorage.get('linksblue.snapshot.' + sourceId);
+  };
+  self.linksblueStorage.setLastSnapshot = function (sourceId, snapshot) {
+    return self.linksblueStorage.set('linksblue.snapshot.' + sourceId, snapshot);
+  };
 })();
