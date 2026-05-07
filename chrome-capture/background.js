@@ -25,6 +25,21 @@ const RETRY_QUEUE_KEY = 'linksblue.retry-queue';
 const RETRY_QUEUE_CAP = 20;
 const MAX_RETRY_ATTEMPTS = 3;
 const POST_STATS_KEY = 'linksblue.post-stats';
+const ALARM_NAME = 'linksblue-snapshot-tick';
+
+// v0.2.0 — flush-only scheduler. The alarm fires every 15 minutes
+// (matching the daemon cadence) and re-attempts queued retries. It
+// does NOT force fresh captures — captures collect opportunistically
+// from the user's normal claude.ai activity. If nothing's queued, the
+// alarm fires and finds nothing to do. That's correct behavior.
+function ensureAlarm() {
+  try {
+    chrome.alarms.create(ALARM_NAME, {
+      periodInMinutes: 15,
+      delayInMinutes: 1,
+    });
+  } catch (_) {}
+}
 
 // v0.2.0: POST a Mode B payload to the ingest endpoint with bearer
 // auth. Throws on non-2xx (caller decides to enqueue or drop).
@@ -170,6 +185,25 @@ chrome.runtime.onInstalled.addListener(async function () {
       await self.linksblueStorage.set('linksblue.captures', []);
     }
   } catch (_) {}
+  ensureAlarm();
+});
+
+chrome.runtime.onStartup.addListener(function () {
+  ensureAlarm();
+});
+
+chrome.alarms.onAlarm.addListener(function (alarm) {
+  if (!alarm || alarm.name !== ALARM_NAME) return;
+  (async function () {
+    try {
+      var result = await flushRetryQueue();
+      if (result && result.attempted > 0) {
+        try { console.log('[linksblue-chrome-capture] alarm flush:', JSON.stringify(result)); } catch (_) {}
+      }
+    } catch (err) {
+      try { console.warn('[linksblue-chrome-capture] alarm flush error:', err && err.message); } catch (_) {}
+    }
+  })();
 });
 
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
