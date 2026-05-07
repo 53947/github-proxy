@@ -22,6 +22,12 @@
 //   - transformConversation(parsedJson) → conversation meta + all
 //     normalized messages (background.js slices from_index → end).
 //   - transformMessage(rawMessage)        → one chat_message normalized.
+//
+// TODO (pass 3): if a Mode B payload's new_messages array would
+// exceed the server's body limit, split across multiple POSTs.
+// Response 05/06/2026-31c bumped the server limit from 100kb to
+// 10mb; very long conversations may eventually need client-side
+// chunking.
 
 (function () {
   function normalizeRole(rawSender) {
