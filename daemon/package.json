@@ -6,7 +6,8 @@
   "main": "daemon.js",
   "scripts": {
     "start": "node daemon.js",
-    "test": "./test.sh"
+    "test": "node --test lib/__tests__/*.test.js",
+    "test:integration": "./test.sh"
   },
   "engines": {
     "node": ">=18.0.0"
