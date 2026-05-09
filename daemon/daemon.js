@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
+const { queueDelta: queueDeltaImpl } = require('./lib/queue');
 
 const SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -106,15 +107,21 @@ function markStale(state) {
 }
 
 // Persist a delta to disk if POST fails — daemon never drops data.
+//
+// Filename is keyed by `source_id` alone; retries against the same
+// source_id overwrite the prior queue file rather than appending a
+// new one (replace-on-retry semantics, latest payload wins). This
+// closes the file-proliferation runaway documented in
+// SEGUE_05-09-2026-41 operational finding (1) — Prompt 05/09/2026-43.
+// See daemon/lib/queue.js for the full design rationale.
 function queueDelta(delta, reason) {
-  const filename = `${delta.source_id}-${Date.now()}.json`.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-  const filepath = path.join(QUEUE_DIR, filename);
-  try {
-    fs.writeFileSync(filepath, JSON.stringify({ delta, reason, queued_at: timestamp() }, null, 2));
-    logInfo(`queued delta source_id=${delta.source_id} reason=${reason} -> ${filename}`);
-  } catch (err) {
-    logError(`failed to queue delta source_id=${delta.source_id}:`, err.message);
-  }
+  queueDeltaImpl({
+    queueDir: QUEUE_DIR,
+    delta,
+    reason,
+    now: timestamp,
+    logger: { info: logInfo, error: logError },
+  });
 }
 
 function loadQueuedDeltas() {
