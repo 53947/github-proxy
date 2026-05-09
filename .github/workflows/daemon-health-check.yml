@@ -1,0 +1,178 @@
+# daemon-health-check.yml — Prompt 05/09/2026-44.
+#
+# Polls the linksblue daemon heartbeat endpoint every 15 minutes. Opens
+# a GitHub issue (or comments on an existing one) if the daemon is
+# stale, reporting unhealthy passes, or unreachable. Closes the issue
+# when health returns.
+#
+# Single-action contract with the daemon-side heartbeat POST in
+# daemon/daemon.js and the linksblue route at routes/daemon-heartbeat.js.
+# Worst-case detection lag = 15 (this interval) + 45 (staleness threshold)
+# = 60 minutes. See SEGUE_05-09-2026-41 operational finding (2).
+
+name: daemon-health-check
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check daemon heartbeat
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const STALE_THRESHOLD_SEC = 45 * 60;
+            const HEARTBEAT_URL = 'https://github.linksblue.network/api/daemon/heartbeat';
+            const ALERT_LABEL = 'daemon-health';
+            const REMEDIATION = [
+              'See `daemon/README.md` (Failure modes table) on linksblue.',
+              'On the daemon host, confirm it is loaded:',
+              '`launchctl list | grep triadblue`',
+              'Reload via:',
+              '`launchctl unload ~/Library/LaunchAgents/com.triadblue.linksblue-daemon.plist && launchctl load ~/Library/LaunchAgents/com.triadblue.linksblue-daemon.plist`',
+            ].join('\n');
+
+            // 1. Fetch heartbeat
+            let httpStatus = null;
+            let body = null;
+            let fetchErr = null;
+            try {
+              const res = await fetch(HEARTBEAT_URL);
+              httpStatus = res.status;
+              try { body = await res.json(); } catch (_) { body = null; }
+            } catch (err) {
+              fetchErr = err;
+            }
+
+            // 2. Decide alert state
+            let alertTitle = null;
+            let alertBody = null;
+            let healthy = false;
+
+            if (fetchErr) {
+              alertTitle = 'daemon-health: endpoint unreachable';
+              alertBody = [
+                `\`GET ${HEARTBEAT_URL}\` failed: \`${fetchErr.message}\`.`,
+                '',
+                'Could be the linksblue endpoint itself or proxy infrastructure. The daemon may be fine.',
+              ].join('\n');
+            } else if (httpStatus === 200 && body) {
+              const isFresh = body.seconds_since != null && body.seconds_since < STALE_THRESHOLD_SEC;
+              const isOk = body.last_pass_status === 'ok';
+              if (isFresh && isOk) {
+                healthy = true;
+                console.log(`healthy. seconds_since=${body.seconds_since} status=${body.last_pass_status} host=${body.host} queue_depth=${body.queue_depth}`);
+              } else if (!isFresh) {
+                alertTitle = 'daemon-health: heartbeat stale';
+                alertBody = [
+                  `Heartbeat is **${body.seconds_since}s** old (threshold ${STALE_THRESHOLD_SEC}s = ${STALE_THRESHOLD_SEC/60}min — three missed passes).`,
+                  '',
+                  `- Last timestamp: \`${body.timestamp}\``,
+                  `- Last status: \`${body.last_pass_status}\``,
+                  `- Last host: \`${body.host}\``,
+                  `- Last queue_depth: ${body.queue_depth}`,
+                  '',
+                  REMEDIATION,
+                ].join('\n');
+              } else {
+                alertTitle = `daemon-health: pass status ${body.last_pass_status}`;
+                alertBody = [
+                  `Daemon's last pass reported \`${body.last_pass_status}\`.`,
+                  '',
+                  `- Timestamp: \`${body.timestamp}\` (${body.seconds_since}s ago)`,
+                  `- Host: \`${body.host}\``,
+                  `- queue_depth: ${body.queue_depth}`,
+                  '- Watchers:',
+                  '```json',
+                  JSON.stringify(body.watchers, null, 2),
+                  '```',
+                  '',
+                  REMEDIATION,
+                ].join('\n');
+              }
+            } else if (httpStatus === 404) {
+              alertTitle = 'daemon-health: no heartbeat ever';
+              alertBody = [
+                `\`GET ${HEARTBEAT_URL}\` returned 404. The daemon has not posted a heartbeat since the linksblue endpoint started serving.`,
+                '',
+                'Expected briefly after a fresh deploy. Persistent 404 (≥1h after deploy) means the daemon is not running or cannot reach the endpoint.',
+                '',
+                REMEDIATION,
+              ].join('\n');
+            } else {
+              alertTitle = `daemon-health: endpoint error ${httpStatus}`;
+              const truncated = (() => {
+                const raw = body ? JSON.stringify(body) : '<no body>';
+                return raw.length > 500 ? raw.slice(0, 500) + '...' : raw;
+              })();
+              alertBody = [
+                `\`GET ${HEARTBEAT_URL}\` returned HTTP \`${httpStatus}\`.`,
+                '',
+                'Response body (truncated 500 chars):',
+                '```',
+                truncated,
+                '```',
+                '',
+                'Could be the linksblue endpoint itself or proxy infrastructure. The daemon may be fine.',
+              ].join('\n');
+            }
+
+            // 3. Find open daemon-health issues for dedupe
+            const allOpen = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const ownIssues = allOpen.data.filter(i =>
+              (i.labels || []).some(l => (typeof l === 'string' ? l : l.name) === ALERT_LABEL)
+            );
+
+            // 4a. Healthy → close any open daemon-health issues
+            if (healthy) {
+              for (const issue of ownIssues) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `Auto-closing — heartbeat is healthy again at ${new Date().toISOString()} (seconds_since=${body.seconds_since}, status=${body.last_pass_status}, host=${body.host}).`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                });
+                console.log(`closed issue #${issue.number}: ${issue.title}`);
+              }
+              return;
+            }
+
+            // 4b. Unhealthy → open new issue or comment on existing
+            const existing = ownIssues.find(i => i.title === alertTitle);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body: `Still **${alertTitle.replace('daemon-health: ', '')}** at ${new Date().toISOString()}.\n\n${alertBody}`,
+              });
+              console.log(`commented on existing issue #${existing.number}: ${alertTitle}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: alertTitle,
+                body: alertBody,
+                labels: [ALERT_LABEL],
+              });
+              console.log(`opened new issue #${created.data.number}: ${alertTitle}`);
+            }

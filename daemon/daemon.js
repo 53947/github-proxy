@@ -25,6 +25,8 @@ const { queueDelta: queueDeltaImpl } = require('./lib/queue');
 const SNAPSHOT_INTERVAL_MS = 15 * 60 * 1000;
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const INGEST_URL = 'https://github.linksblue.network/api/archive/ingest';
+const HEARTBEAT_URL = 'https://github.linksblue.network/api/daemon/heartbeat';
+const DAEMON_ID = 'linksblue-daemon';
 const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, '.linksblue-daemon');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
@@ -241,6 +243,14 @@ async function runSnapshot(state, key) {
   ensureDirs();
   markStale(state);
 
+  // Per-pass health bookkeeping. Populated as watchers run and read by
+  // postHeartbeat at the end of the pass. Local to this function — does
+  // NOT mutate `state`, so it stays out of state.json on disk.
+  const passInfo = {
+    watchers: {},
+    last_pass_status: 'ok',
+  };
+
   // 1. Drain any queued deltas first.
   await drainQueue(key);
 
@@ -255,6 +265,7 @@ async function runSnapshot(state, key) {
     try {
       const deltas = await w.fn(state, { logInfo, logError, recordParseFailure, maybeOpenIssue });
       logInfo(`watcher ${w.name}: ${deltas.length} delta(s)`);
+      passInfo.watchers[w.name] = { deltas: deltas.length, ok: true };
       for (const delta of deltas) {
         const result = await postDelta(delta, key);
         if (result.ok) {
@@ -274,10 +285,75 @@ async function runSnapshot(state, key) {
       }
     } catch (err) {
       logError(`watcher ${w.name} threw:`, err.message);
+      passInfo.watchers[w.name] = { deltas: 0, ok: false };
+      passInfo.last_pass_status = 'degraded';
     }
   }
 
   saveState(state);
+
+  // 3. POST heartbeat. Best-effort — failures are logged and swallowed
+  //    so monitoring can never break primary capture work.
+  try {
+    await postHeartbeat(passInfo, key);
+  } catch (err) {
+    logError('postHeartbeat threw (should never happen — defensive catch):', err.message);
+  }
+}
+
+// Heartbeat — Prompt 05/09/2026-44.
+//
+// Posts one JSON heartbeat to /api/daemon/heartbeat after each
+// successful pass. The endpoint persists the latest heartbeat to
+// TRIADBLUE/ai-archive at monitoring/heartbeat-{daemon_id}.json and
+// a scheduled GitHub Action polls every 15 minutes. If the heartbeat
+// goes stale (≥45 min), the Action opens an issue.
+//
+// Why no local heartbeat file: the daemon runs on Dean's Mac which is
+// not reachable from a GitHub Action. The single source of truth for
+// "is the daemon alive" is the linksblue endpoint. A local file would
+// only confirm something to the daemon's own host, defeating the
+// remote-monitoring purpose.
+//
+// Why this never throws: monitoring failure must never break primary
+// capture work. Network errors, auth drift, schema changes — all are
+// logged at ERROR and swallowed. The Action will alert anyway because
+// no heartbeat arrived. Schema lives at routes/daemon-heartbeat.js
+// validateBody().
+async function postHeartbeat(passInfo, key) {
+  const queueDepth = (() => {
+    try {
+      return fs.readdirSync(QUEUE_DIR).filter(f => f.endsWith('.json')).length;
+    } catch (_) {
+      return 0;
+    }
+  })();
+  const payload = {
+    daemon_id: DAEMON_ID,
+    host: os.hostname(),
+    timestamp: timestamp(),
+    last_pass_status: passInfo.last_pass_status,
+    watchers: passInfo.watchers,
+    queue_depth: queueDepth,
+  };
+  try {
+    const res = await fetch(HEARTBEAT_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      logInfo(`heartbeat ok status=${payload.last_pass_status} queue_depth=${queueDepth}`);
+    } else {
+      const text = await res.text();
+      logError(`heartbeat ${res.status}:`, text.slice(0, 200));
+    }
+  } catch (err) {
+    logError('heartbeat network error:', err.message);
+  }
 }
 
 async function main() {

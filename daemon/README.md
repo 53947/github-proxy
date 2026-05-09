@@ -63,7 +63,37 @@ nested deeper are intentionally skipped.
      update `state.json` with the new index and `snapshot_count`.
    - On 5xx / network errors: exponential backoff (1s, 2s, 4s),
      max 3 retries, then queue locally.
+   - POST a heartbeat to `/api/daemon/heartbeat` after `saveState`
+     returns. Best-effort: failure is logged and swallowed so
+     monitoring can never break primary capture work.
 4. On `SIGTERM` / `SIGINT`: flush state, exit cleanly.
+
+## Health monitoring
+
+After every successful pass, the daemon POSTs a heartbeat to
+`https://github.linksblue.network/api/daemon/heartbeat` with the
+per-watcher delta counts, the queue depth, and a `last_pass_status`
+of `ok` / `degraded` / `failed`. The endpoint persists the latest
+heartbeat to `TRIADBLUE/ai-archive` at
+`monitoring/heartbeat-linksblue-daemon.json`.
+
+A scheduled GitHub Action in `linksblue/.github/workflows/daemon-health-check.yml`
+polls the GET endpoint every 15 minutes and opens a `daemon-health`-labeled
+issue if:
+
+- the heartbeat is older than 45 minutes (three missed passes), OR
+- `last_pass_status` is not `ok`, OR
+- the endpoint returns 404 (no heartbeat ever — expected briefly after
+  a fresh deploy, persistent past ~1 hour means the daemon is not
+  reaching the endpoint), OR
+- the endpoint is otherwise unreachable.
+
+Issues are deduplicated by title — the first stale check opens an issue;
+subsequent stale checks comment on it; a healthy check closes it. Worst-
+case detection lag from "daemon stopped POSTing" to "issue opened" is
+the Action interval (15 min) plus the staleness threshold (45 min) =
+60 minutes. (Built in response to the 3-day silent outage documented in
+`SEGUE_05-09-2026-41` operational finding (2). Prompt 05/09/2026-44.)
 
 ## Install
 
