@@ -16,6 +16,7 @@
 // Mounted in index.js via:
 //   app.use('/api/archive', require('./routes/archive-ingest'));
 
+const crypto = require('crypto');
 const express = require('express');
 const router = express.Router();
 
@@ -64,13 +65,44 @@ function slugify(title) {
     .slice(0, 60) || 'untitled';
 }
 
-function pathFor({ startedAt, platform, slug }) {
+// Path discriminator — first 8 hex of sha256(source_id). Why this exists:
+//
+// The slug is a lossy function of the title (lower-case, strip non-
+// alphanumerics, truncate at 60 chars). Two distinct conversations
+// captured on the same date with the same platform whose titles share
+// the leading 60 slug-chars will collide on the path. Until 2026-05-09
+// the endpoint surfaced the collision as HTTP 409 with a hint suggesting
+// the caller add a discriminator to the title — but the endpoint itself
+// is in the right place to do that, deterministically and without
+// burdening callers. Adding `-${first-8-hex-of-sha256(source_id)}` to
+// every new path makes the path uniquely keyed off source_id (which is
+// already unique per conversation), so two distinct source_ids cannot
+// collide regardless of how their titles slugify.
+//
+// Backward compatibility: legacy archive files written before this fix
+// live at `{date}-{platform}-{slug}.md` (no discriminator suffix). They
+// are NOT migrated. `ghSearchSourceId` searches by frontmatter content,
+// not by path, so it still finds them. Mode B append continues writing
+// to whatever existing path the search returned, so legacy files keep
+// being appended at their legacy path — only new conversations after
+// this fix get the discriminator.
+//
+// 8 hex chars = ~4.3B values. Birthday-collision probability across 1M
+// archive files ≈ 1 in 100. Effectively zero in practice. Revisit with
+// a longer discriminator if we ever cross ~10M files; not a concern
+// for many years.
+function pathDiscriminator(sourceId) {
+  return crypto.createHash('sha256').update(String(sourceId)).digest('hex').slice(0, 8);
+}
+
+function pathFor({ startedAt, platform, slug, sourceId }) {
   const d = new Date(startedAt);
   const yyyy = String(d.getUTCFullYear());
   const mm   = String(d.getUTCMonth() + 1).padStart(2, '0');
   const dd   = String(d.getUTCDate()).padStart(2, '0');
+  const disc = pathDiscriminator(sourceId);
   return {
-    full: `${yyyy}/${mm}/${dd}-${platform}-${slug}.md`,
+    full: `${yyyy}/${mm}/${dd}-${platform}-${slug}-${disc}.md`,
     date: `${yyyy}-${mm}-${dd}`,
   };
 }
@@ -178,7 +210,7 @@ async function handleModeA(req, res) {
   }
 
   const slug = slugify(title);
-  const p    = pathFor({ startedAt: started_at, platform, slug });
+  const p    = pathFor({ startedAt: started_at, platform, slug, sourceId: source_id });
   const fm   = buildFrontmatter({
     date: p.date,
     platform,
@@ -230,7 +262,7 @@ async function handleModeB(req, res) {
   // ----- First snapshot: file does not exist yet -----
   if (!existingPath) {
     const slug = slugify(title);
-    const p = pathFor({ startedAt: started_at, platform, slug });
+    const p = pathFor({ startedAt: started_at, platform, slug, sourceId: source_id });
     const fm = buildFrontmatter({
       date: p.date,
       platform,
@@ -381,3 +413,8 @@ router.post('/ingest', requireBearer, async (req, res) => {
 });
 
 module.exports = router;
+// Exposed for unit tests in routes/__tests__/. The router export above is
+// what index.js mounts at /api/archive; these named exports are for tests.
+module.exports.pathFor = pathFor;
+module.exports.pathDiscriminator = pathDiscriminator;
+module.exports.slugify = slugify;
